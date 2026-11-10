@@ -1,0 +1,50 @@
+Environment: Linux x86_64; Python 3.13.5
+Offline/mock tests only. No real OpenAI call, game control, GitHub repository creation or push.
+
+test_extra_fields_rejected (test_quiz.APIParsingTests.test_extra_fields_rejected) ... ok
+test_incomplete (test_quiz.APIParsingTests.test_incomplete) ... ok
+test_refusal (test_quiz.APIParsingTests.test_refusal) ... ok
+test_valid_json (test_quiz.APIParsingTests.test_valid_json) ... ok
+test_cache_hit_does_not_require_model (test_quiz.ModelConfigurationTests.test_cache_hit_does_not_require_model) ... ok
+test_explicit_model_overrides_environment (test_quiz.ModelConfigurationTests.test_explicit_model_overrides_environment) ... ok
+test_missing_model_stops_before_network (test_quiz.ModelConfigurationTests.test_missing_model_stops_before_network) ... ok
+test_model_from_environment (test_quiz.ModelConfigurationTests.test_model_from_environment) ... ok
+test_duplicate_options_rejected (test_quiz.QuestionTests.test_duplicate_options_rejected) ... ok
+test_game_day_0500_cn (test_quiz.QuestionTests.test_game_day_0500_cn) ... ok
+test_negation_not_ignored (test_quiz.QuestionTests.test_negation_not_ignored) ... ok
+test_non_quiz_scene_rejected (test_quiz.QuestionTests.test_non_quiz_scene_rejected) ... ok
+test_number_not_ignored (test_quiz.QuestionTests.test_number_not_ignored) ... ok
+test_order_invariant (test_quiz.QuestionTests.test_order_invariant) ... ok
+test_ordinal_ignored (test_quiz.QuestionTests.test_ordinal_ignored) ... ok
+test_positional_options_not_permuted (test_quiz.QuestionTests.test_positional_options_not_permuted) ... ok
+test_scope_separation (test_quiz.QuestionTests.test_scope_separation) ... ok
+test_view_instance_changes (test_quiz.QuestionTests.test_view_instance_changes) ... ok
+test_abstain_cached (test_quiz.StoreTests.test_abstain_cached) ... ok
+test_cache_miss_without_ai (test_quiz.StoreTests.test_cache_miss_without_ai) ... ok
+test_candidate_cached_no_second_call (test_quiz.StoreTests.test_candidate_cached_no_second_call) ... ok
+test_claim_is_one_shot (test_quiz.StoreTests.test_claim_is_one_shot) ... ok
+test_concurrent_resolve_one_request (test_quiz.StoreTests.test_concurrent_resolve_one_request) ... ok
+test_daily_limit (test_quiz.StoreTests.test_daily_limit) ... ok
+test_duplicate_feedback_not_counted (test_quiz.StoreTests.test_duplicate_feedback_not_counted) ... ok
+test_expired_decision_not_claimed (test_quiz.StoreTests.test_expired_decision_not_claimed) ... ok
+test_explicit_refresh_receives_rejected_options (test_quiz.StoreTests.test_explicit_refresh_receives_rejected_options) ... ok
+test_game_feedback_requires_submission (test_quiz.StoreTests.test_game_feedback_requires_submission) ... ok
+test_invalidated_decision_not_claimed (test_quiz.StoreTests.test_invalidated_decision_not_claimed) ... ok
+test_nonoption_rejected (test_quiz.StoreTests.test_nonoption_rejected) ... ok
+test_rejected_option_cannot_return (test_quiz.StoreTests.test_rejected_option_cannot_return) ... ok
+test_stale_screen_not_claimed (test_quiz.StoreTests.test_stale_screen_not_claimed) ... ok
+test_swapped_layout_not_claimed (test_quiz.StoreTests.test_swapped_layout_not_claimed) ... ok
+test_unknown_not_verified_or_requeried (test_quiz.StoreTests.test_unknown_not_verified_or_requeried) ... ok
+test_unresolved_prior_submission_blocks_new_instance (test_quiz.StoreTests.test_unresolved_prior_submission_blocks_new_instance) ... ok
+test_verified_not_silently_overwritten (test_quiz.StoreTests.test_verified_not_silently_overwritten) ... ok
+test_verified_remaps_letter (test_quiz.StoreTests.test_verified_remaps_letter) ... ok
+test_wrong_quarantined (test_quiz.StoreTests.test_wrong_quarantined) ... ok
+
+----------------------------------------------------------------------
+Ran 38 tests in 0.026s
+
+OK
+
+Publication flow: 4 additional local MOCK tests passed (success/SHA verification, account mismatch, existing repository, failed creation).
+All GitHub and Git commands in those 4 flow tests were simulated. They do NOT establish that a remote repository exists.
+Real Windows and GitHub publication are NOT tested.

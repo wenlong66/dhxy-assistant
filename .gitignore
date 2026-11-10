@@ -1,0 +1,30 @@
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Runtime / account data
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+data/
+logs/
+captures/
+screenshots/
+# Python and editor files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Local publication audit
+publication-result.json

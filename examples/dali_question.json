@@ -1,0 +1,12 @@
+{
+  "scene": "dali_quiz",
+  "scope": "dhxy-mobile-cn:profile-v1",
+  "instance_id": "manual-sample-1",
+  "stem": "第1/10题：南冠客的五行修炼等级达到了34级，为了在战斗中提升自己的血量和控制法术抗性，他可以选择使用以下哪种道具？",
+  "options": {
+    "A": "圣兽丹",
+    "B": "高级金柳露",
+    "C": "灵兽丹",
+    "D": "浪淘沙抗性卡"
+  }
+}

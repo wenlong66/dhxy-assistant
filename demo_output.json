@@ -1,0 +1,28 @@
+{
+  "mode": "OFFLINE MOCK ONLY",
+  "first_decision": {
+    "question_key": "784032f3bf691263e97b6bfaaed1d8c8bbc319d9c58d8a7d722c41887f0e8961",
+    "view_token": "95eccb7c4a96e561f519381ce4806c7efad242acb2a3a001b436e5b83cfa4a82",
+    "answer_text": "北京",
+    "label": "A",
+    "status": "candidate",
+    "origin": "openai",
+    "reason": "Offline mock, not a real model output.",
+    "attempt_id": "e3c7d666e6d743d891c14dce85052fb4",
+    "can_submit": true
+  },
+  "submission_guard_claimed_without_clicking": true,
+  "shuffled_cache_result": {
+    "question_key": "784032f3bf691263e97b6bfaaed1d8c8bbc319d9c58d8a7d722c41887f0e8961",
+    "view_token": "57cbab6d4b2acb94890852d6ecfa5f1f92897501d32fea567cafd4af51a4085f",
+    "answer_text": "北京",
+    "label": "D",
+    "status": "verified",
+    "origin": "cache",
+    "reason": "Confirmed by game_ui",
+    "attempt_id": "956043ffea81487c9af1945ffce6141d",
+    "can_submit": true
+  },
+  "mock_provider_calls": 1,
+  "note": "No game connection, real AI call or real-game answer was involved."
+}
