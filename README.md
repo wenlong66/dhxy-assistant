@@ -1,10 +1,32 @@
 # DHXY Assistant — 大话西游手游个人辅助
 
-当前版本：答题核心 v0.1.1；设备与 MaaFramework 适配尚未完成。
+当前版本：**v0.2.0 — MaaFramework / Android ADB / 本地 OCR 集成初版**。
 
-本包是可运行、可离线测试的 Python 答题核心，**不是完整日常助手，也不是 Windows 安装包**。
-它不登录游戏、不读密码、不截图、不做 OCR、不连接模拟器、不点击游戏。
-游戏入口、截图识别、答案提交和结果反馈需要后续 MaaFramework 适配器。
+新增真实设备适配代码：设备发现与连接、截图、区域预览、Maa OCR、题库/AI 衔接、
+提交前画面复核和显式单题点击。**不是已经实机验收的完整日常助手，也不是 Windows 安装包。**
+你仍需手动登录游戏、进入大理寺题目；本版不自动答完十题，也不自动识别答对/答错。
+
+**Windows 接入步骤：[docs/EMULATOR.md](docs/EMULATOR.md)**  
+**测试范围：[docs/VALIDATION.md](docs/VALIDATION.md)**（93 项离线测试；没有真实模拟器/OCR 推理测试）。
+
+```powershell
+py -3.11 -m venv .venv
+$PY = ".\.venv\Scripts\python.exe"
+& $PY -m pip install -r requirements-device.txt
+& $PY setup_ocr.py
+& $PY device_app.py init-config
+& $PY device_app.py devices
+# 手动登录并打开大理寺题目后：
+& $PY device_app.py capture
+& $PY device_app.py inspect
+& $PY device_app.py answer
+```
+
+默认不点击、不调用 OpenAI。设备选项见 `config/connection.example.json`；
+真实本机配置、截图、题库和下载模型均已加入 `.gitignore`。
+初始 ROI 来自用户提供的参考图，需在自己的设备上检查，不能把它当作已验证通用模板。
+
+原 `app.py` 仍是完全不操作游戏的独立答题核心，以下为其使用方式。
 
 ## 本次实现
 
@@ -20,7 +42,7 @@
 - 可明确选择上传一张用户已裁好的题目图片；默认只传题干和选项文本。
 - API Key 从本机进程环境或本机终端隐藏输入读取，不写进数据库或源码。
 
-**不包含**：OCR 引擎、MaaFramework 插件/任务包、ADB 控制、自动反馈识别、GUI、游戏实测、在线搜索题库、自动模型升级。不能把输入 JSON 的 `scene` 标签当成真实画面已通过检测。
+**尚未包含**：自动反馈识别、完整十题循环、日常任务导航、GUI、游戏实测、在线搜索题库、自动模型升级。独立核心输入 JSON 的 `scene` 标签不代表真实画面已通过检测；设备入口另做标题/标签/题号校验。
 
 ## 运行
 
@@ -118,7 +140,7 @@ py app.py recover --all-workers-stopped
 
 1. 本地识别确实进入普通“大理寺答题”，排除登录、安全挑战和其他弹窗。
 2. 对题干、四个选项做局部 OCR；两次稳定读数一致后组装 `Question`。
-3. 为本次题目展示赋予唯一 `instance_id`，并在换题、退出/重进时更新。
+3. 为本次题目展示赋予唯一 `instance_id`，换题时更新；v0.2 使用账号 scope/设备/游戏日/题号生成保守稳定标识，避免重启或重进同一题造成重复点击。
 4. 工作线程调用 `store.resolve(...)`，不要阻塞桌面 UI。不要持续逐帧调用它。
 5. 模型返回后重新截图、识别，确认题目实例、文字、顺序和页面都没改变。
 6. 只有策略允许的答案才能提交；首次 AI 候选需要显式的 `allow_trial=True`。
@@ -141,9 +163,9 @@ OpenAI 请求设 `store=false`，不传历史聊天；这不等于承诺服务�
 
 ## 验证范围
 
-本次已做离线单元测试和模拟响应解析测试，未使用真实 API Key，未发生真实 OpenAI 调用，
+本次已做93项离线单元测试与设备接口模拟测试，未使用真实 API Key，未发生真实 OpenAI 调用，
 未连接你的电脑、模拟器或账号；未验证 Windows 游戏内任务执行。
-具体测试结果见 `TEST_RESULTS.txt`，示例输出见 `demo_output.json`。
+当前测试范围见 `docs/VALIDATION.md`；`TEST_RESULTS.txt` 与 `demo_output.json` 是旧版核心历史记录。
 
 ## 官方参考文档
 
@@ -160,6 +182,6 @@ OpenAI 请求设 `store=false`，不传历史聊天；这不等于承诺服务�
 
 ## 当前边界
 
-此项目并非网易官方工具，不承诺游戏账号安全。仅保留普通知识答题核心；
-不会处理登录验证、安全挑战、游戏内存修改或交易。设备控制尚未实现。
+此项目并非网易官方工具，不承诺游戏账号安全。仅适配普通知识答题与其所需设备接口；
+不会处理登录验证、安全挑战、游戏内存修改或交易。设备控制代码已接入，但未在真实模拟器上执行验证。
 本版本未指定软件许可证；公开可见性与后续许可证选择分别处理。

@@ -1,0 +1,4 @@
+# Optional device/OCR integration; the original quiz core remains standard-library-only.
+maafw==5.15.0
+numpy>=1.26,<3
+Pillow>=10,<13

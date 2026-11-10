@@ -1,0 +1,10 @@
+{
+  "DaliSceneGuard": {
+    "recognition": "OCR",
+    "expected": ["大理寺答题"],
+    "roi": [344, 65, 182, 31],
+    "threshold": 0.8,
+    "action": "DoNothing",
+    "timeout": 1500
+  }
+}

@@ -28,3 +28,8 @@ venv/
 Thumbs.db
 # Local publication audit
 publication-result.json
+# Local device config, screenshots and downloaded third-party model weights
+config/local.json
+config/*.local.json
+assets/resource/model/ocr/
+*.device.lock

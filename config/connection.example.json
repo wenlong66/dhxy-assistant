@@ -1,0 +1,10 @@
+{
+  "adb_path": "",
+  "address": "",
+  "resource_dir": "assets/resource",
+  "layout": "config/dali.layout.json",
+  "database": "data/quiz.sqlite3",
+  "runtime_dir": "data/maa",
+  "account_scope": "dhxy-mobile-cn:personal-main",
+  "timeout_seconds": 20
+}
