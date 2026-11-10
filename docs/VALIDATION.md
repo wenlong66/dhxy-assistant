@@ -1,3 +1,16 @@
+# v0.3.0 GUI 验证补充
+
+本地 Linux / Python 3.13.5：`python -m unittest discover -s tests -v` 通过 **101 项**。
+新增测试覆盖 GUI 后端本地配置不泄漏 Key、SQLite 只读搜索与隔离、
+FakeSession 的连接/截图/断开、未提交答题的反馈保护，以及 API 返回后取消不再点击。
+`gui_app.py`、`gui_backend.py`、`quiz_core.py`、`quiz_vision.py` 均已通过 `compileall`。
+
+**没有安装 PySide6 或 Maa 本机依赖的环境不能实际启动窗口或加载原生 DLL。**
+本轮未执行 Windows Qt 窗口运行、真实 ADB/模拟器测试、中文 OCR 模型推理、API 付费请求。
+运行时可用性需按 `docs/GUI.md` 在 Windows 环境验证。
+
+---
+
 # v0.2.0 验证记录
 
 ## 已执行

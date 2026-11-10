@@ -1,3 +1,16 @@
+# Changelog
+
+## v0.3.0 — Windows GUI（尚未实机验收）
+
+- 新增 `gui_app.py`，PySide6 多标签 GUI：模拟器连接、定时只读画面、OCR 调试、
+  单题答题预览/明确提交、题库查看/反馈、本地连接设置与日志。
+- 新增 `gui_backend.py`，后台线程独占 MaaSession、数据库读取与设置白名单。
+- 新增 `setup_gui.bat`、`start_gui.bat`、`requirements-gui.txt` 及 `docs/GUI.md`。
+- OpenAI Provider 支持仅保存在内存中的显式 API Key；默认不调用 AI。
+- 取消标志会在 API 请求返回后及实际点击前检查；停止不强制中断已发送请求。
+- 其他日常任务在 GUI 中显示为未接入，不提供虚假的可执行操作。
+- 新增后端离线测试；Qt 原生窗口及模拟器仍需目标电脑验收。
+
 # 变更记录
 
 ## v0.2.0 — MaaFramework、OCR 与 Android 设备接入

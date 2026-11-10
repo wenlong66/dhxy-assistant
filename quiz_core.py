@@ -158,15 +158,17 @@ class OpenAIProvider:
     ENDPOINT = "https://api.openai.com/v1/responses"
 
     def __init__(self, model: str | None = None, timeout: float = 25.0,
-                 max_output_tokens: int = 1536):
+                 max_output_tokens: int = 1536, api_key: str | None = None):
         self.model = (model or os.environ.get("OPENAI_MODEL", "")).strip()
         self.timeout = timeout
         self.max_output_tokens = max_output_tokens
+        # Explicit keys are kept in memory only; GUI must not write them to config or logs.
+        self._api_key = api_key
 
     def answer(self, q: Question, rejected: list[str], image: Path | None = None) -> AIAnswer:
         if not self.model:
             raise QuizError("Set --model or OPENAI_MODEL to a model available to your account before requesting AI.")
-        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        key = (self._api_key if self._api_key is not None else os.environ.get("OPENAI_API_KEY", "")).strip()
         if not key:
             raise QuizError("OPENAI_API_KEY is unavailable in this process; use secure key setup. Never paste it into chat.")
         context = {"game": "大话西游手游", "scope": q.scope, "scene": q.scene,

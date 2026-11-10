@@ -1,0 +1,674 @@
+"""Windows desktop UI for DHXY Assistant v0.3.
+
+Run: python gui_app.py (after pip install -r requirements-gui.txt).
+All device/OCR/OpenAI calls are serialized on one background thread.
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from PySide6.QtCore import QObject, Qt, Signal, QSize, QUrl
+    from PySide6.QtGui import QDesktopServices, QPixmap
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QComboBox, QFormLayout, QFrame, QGroupBox,
+        QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+        QPlainTextEdit, QScrollArea, QSpinBox, QSplitter, QTabWidget,
+        QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
+    )
+except ImportError:
+    print("GUI dependency missing. Run: python -m pip install -r requirements-gui.txt", file=sys.stderr)
+    raise SystemExit(2)
+
+from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, local_settings, save_local_settings
+from quiz_core import QuizError
+
+
+class Bridge(QObject):
+    message = Signal(str, object)
+
+
+class DeviceWorker:
+    """The only thread that touches a MaaSession or its resources."""
+
+    def __init__(self, bridge: Bridge, backend_factory=DeviceBackend):
+        self.bridge = bridge
+        self.backend_factory = backend_factory
+        self.queue: queue.Queue[tuple[str, dict]] = queue.Queue()
+        self.cancelled = threading.Event()
+        self.alive = threading.Event()
+        self.alive.set()
+        self.preview_enabled = False
+        self.busy = False
+        self.stop_requested = False
+        self._lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="dhxy-device-worker")
+        self.thread.start()
+
+    def submit(self, command: str, **arguments) -> bool:
+        with self._lock:
+            if self.busy or self.stop_requested or not self.alive.is_set():
+                return False
+            self.busy = True
+            self.cancelled.clear()
+            self.queue.put((command, arguments))
+            return True
+
+    def pause_preview(self):
+        self.preview_enabled = False
+
+    def resume_preview(self):
+        self.preview_enabled = True
+
+    def stop(self):
+        """Fail closed: no future answer click; disconnection follows the active job."""
+        with self._lock:
+            if self.stop_requested:
+                return
+            self.stop_requested = True
+            self.cancelled.set()
+            self.preview_enabled = False
+            # Only one foreground command can be queued. Disconnect afterwards.
+            self.queue.put(("disconnect", {}))
+        self.bridge.message.emit("stop_requested", None)
+
+    def shutdown(self):
+        self.cancelled.set()
+        self.preview_enabled = False
+        self.alive.clear()
+        self.queue.put(("exit", {}))
+
+    def _run(self):
+        backend = self.backend_factory()
+        last_preview = 0.0
+        import time
+        try:
+            while True:
+                try:
+                    command, args = self.queue.get(timeout=0.20)
+                except queue.Empty:
+                    if (self.alive.is_set() and self.preview_enabled
+                            and backend.session is not None and not self.busy
+                            and time.monotonic() - last_preview > 2.0):
+                        last_preview = time.monotonic()
+                        try:
+                            self.bridge.message.emit("preview", backend.capture())
+                        except Exception as exc:
+                            self.preview_enabled = False
+                            self.bridge.message.emit("preview_error", str(exc))
+                    continue
+
+                if command == "exit":
+                    break
+                if command == "disconnect":
+                    try:
+                        backend.disconnect()
+                        self.bridge.message.emit("disconnected", {})
+                    except Exception as exc:
+                        self.bridge.message.emit("error", ("disconnect", str(exc)))
+                        # DeviceBackend.disconnect releases its lock even on close errors.
+                        self.bridge.message.emit("disconnected", {})
+                    finally:
+                        with self._lock:
+                            self.stop_requested = False
+                    continue
+
+                self.bridge.message.emit("started", command)
+                try:
+                    # Cancellation persists for the complete in-flight operation.
+                    if self.cancelled.is_set():
+                        raise QuizError("Stopped before starting the operation.")
+                    if command == "devices":
+                        result = backend.devices()
+                    elif command == "connect":
+                        result = backend.connect()
+                        self.preview_enabled = True
+                    elif command == "capture":
+                        result = backend.capture(save=True, overlay=True)
+                    elif command == "inspect":
+                        result = backend.inspect()
+                    elif command == "guard":
+                        result = backend.guard()
+                    elif command == "answer":
+                        result = backend.answer(should_stop=self.cancelled.is_set, **args)
+                    elif command == "bank":
+                        result = backend.bank(args.get("keyword", ""))
+                    elif command == "feedback":
+                        result = backend.feedback(**args)
+                    else:
+                        raise QuizError("Unknown worker command.")
+                    outcome = "done"
+                    message = (command, result)
+                except Exception as exc:
+                    # Do not echo request contents, credentials or full stack traces.
+                    outcome = "error"
+                    message = (command, str(exc))
+                finally:
+                    with self._lock:
+                        self.busy = False
+                # Publish after clearing busy: the UI can re-enable controls immediately.
+                self.bridge.message.emit(outcome, message)
+        finally:
+            try:
+                backend.shutdown()
+            finally:
+                self.bridge.message.emit("worker_stopped", None)
+
+
+def make_button(text: str, callback):
+    b = QPushButton(text)
+    b.clicked.connect(callback)
+    return b
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("大话西游手游助手 · v0.3.0")
+        self.resize(1280, 850)
+        self.setMinimumSize(1000, 690)
+        self.bridge = Bridge()
+        self.worker = DeviceWorker(self.bridge)
+        self.bridge.message.connect(self.on_event)
+        self.connected = False
+        self.current_busy = False
+        self.was_stopped = False
+        self.stopping = False
+        self.raw_preview: bytes | None = None
+        self.last_inspection_valid = False
+        self._make_ui()
+        self._load_settings()
+        self.log("GUI 已启动。默认只读；仅大理寺单题预览和显式单次提交可用。")
+        self._refresh_controls()
+
+    def _make_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        main = QVBoxLayout(root)
+        main.setContentsMargins(16, 12, 16, 12)
+        main.setSpacing(12)
+
+        heading = QHBoxLayout()
+        title = QLabel("大话西游 · 日常助手")
+        title.setObjectName("mainTitle")
+        heading.addWidget(title)
+        heading.addStretch()
+        self.status = QLabel("未连接")
+        self.status.setObjectName("status")
+        heading.addWidget(self.status)
+        main.addLayout(heading)
+
+        device_group = QGroupBox("Android 模拟器连接")
+        devices = QHBoxLayout(device_group)
+        self.device_combo = QComboBox()
+        self.device_combo.setMinimumWidth(340)
+        self.device_combo.addItem("尚未扫描设备", None)
+        self.scan_btn = make_button("扫描设备", lambda: self.run_command("devices"))
+        self.connect_btn = make_button("连接", self.connect_device)
+        self.disconnect_btn = make_button("断开 / 停止", self.stop_device)
+        devices.addWidget(self.device_combo, stretch=1)
+        devices.addWidget(self.scan_btn)
+        devices.addWidget(self.connect_btn)
+        devices.addWidget(self.disconnect_btn)
+        main.addWidget(device_group)
+
+        self.tabs = QTabWidget()
+        main.addWidget(self.tabs, stretch=1)
+        self._make_task_tab()
+        self._make_ocr_tab()
+        self._make_bank_tab()
+        self._make_settings_tab()
+
+        log_group = QGroupBox("运行日志（仅本地显示）")
+        log_layout = QVBoxLayout(log_group)
+        self.logs = QPlainTextEdit()
+        self.logs.setObjectName("logs")
+        self.logs.setReadOnly(True)
+        self.logs.setMaximumBlockCount(500)
+        self.logs.setMinimumHeight(120)
+        log_layout.addWidget(self.logs)
+        main.addWidget(log_group)
+
+    def _make_task_tab(self):
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        left = QVBoxLayout()
+        right = QVBoxLayout()
+        layout.addLayout(left, 2)
+        layout.addLayout(right, 3)
+
+        tasks = QGroupBox("任务选择")
+        task_l = QVBoxLayout(tasks)
+        self.dali_check = QCheckBox("大理寺答题（仅单题；已接入）")
+        self.dali_check.setChecked(True)
+        task_l.addWidget(self.dali_check)
+        for item in ("师门任务（尚未接入）", "帮派任务（尚未接入）", "宝图任务（尚未接入）", "五环任务（尚未接入）"):
+            check = QCheckBox(item)
+            check.setEnabled(False)
+            task_l.addWidget(check)
+        task_l.addWidget(QLabel("目前不支持一键完成全部日常，无法自动进入题目场景。"))
+        left.addWidget(tasks)
+
+        options = QGroupBox("答题控制")
+        options_l = QVBoxLayout(options)
+        self.ai_enabled = QCheckBox("题库未命中时询问 OpenAI（可能产生费用）")
+        self.allow_trial = QCheckBox("允许试答尚未验证的 AI 候选")
+        self.layout_confirmed = QCheckBox("已核对本设备 OCR、选项位置与区域框图")
+        for ch in (self.ai_enabled, self.allow_trial, self.layout_confirmed):
+            options_l.addWidget(ch)
+        self.model_edit = QLineEdit(os.environ.get("OPENAI_MODEL", ""))
+        self.model_edit.setPlaceholderText("API 模型 ID（仅开启 AI 时需要）")
+        options_l.addWidget(self.model_edit)
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("OpenAI API Key（仅当前运行内存使用，不保存）")
+        options_l.addWidget(self.key_edit)
+        max_row = QHBoxLayout()
+        max_row.addWidget(QLabel("每日 AI 请求次数上限："))
+        self.max_calls = QSpinBox()
+        self.max_calls.setRange(1, 1000)
+        self.max_calls.setValue(30)
+        max_row.addWidget(self.max_calls)
+        max_row.addStretch()
+        options_l.addLayout(max_row)
+        left.addWidget(options)
+
+        controls = QHBoxLayout()
+        self.preview_btn = make_button("开始 / 预览本题答案", self.preview_answer)
+        self.execute_btn = make_button("提交本题一次", self.execute_answer)
+        self.pause_btn = make_button("暂停画面预览", self.toggle_preview)
+        controls.addWidget(self.preview_btn)
+        controls.addWidget(self.execute_btn)
+        controls.addWidget(self.pause_btn)
+        left.addLayout(controls)
+
+        self.answer_out = QPlainTextEdit()
+        self.answer_out.setReadOnly(True)
+        self.answer_out.setPlaceholderText("答题建议、来源和提交回执会显示在这里。")
+        answer_box = QGroupBox("答题结果")
+        al = QVBoxLayout(answer_box)
+        al.addWidget(self.answer_out)
+        left.addWidget(answer_box, stretch=1)
+
+        video_box = QGroupBox("游戏画面（约每 2 秒刷新，仅截图）")
+        vl = QVBoxLayout(video_box)
+        self.preview_label = QLabel("请先扫描并连接 Android 模拟器")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(460, 290)
+        self.preview_label.setObjectName("preview")
+        vl.addWidget(self.preview_label, stretch=1)
+        row = QHBoxLayout()
+        self.screenshot_btn = make_button("保存截图和区域框图", lambda: self.run_command("capture"))
+        self.inspect_btn = make_button("OCR 识别当前题", lambda: self.run_command("inspect"))
+        self.guard_btn = make_button("校验答题界面", lambda: self.run_command("guard"))
+        row.addWidget(self.screenshot_btn)
+        row.addWidget(self.inspect_btn)
+        row.addWidget(self.guard_btn)
+        vl.addLayout(row)
+        right.addWidget(video_box, stretch=1)
+        self.tabs.addTab(page, "任务与画面")
+
+    def _make_ocr_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        note = QLabel("先手动打开大理寺题目，再点击 OCR 识别；可在本地诊断文件中查看文字及区域框图。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        row.addWidget(make_button("重新识别", lambda: self.run_command("inspect")))
+        row.addWidget(make_button("打开诊断目录", self.open_diagnostics))
+        row.addStretch()
+        layout.addLayout(row)
+        self.ocr_out = QPlainTextEdit()
+        self.ocr_out.setReadOnly(True)
+        layout.addWidget(self.ocr_out, stretch=1)
+        self.tabs.addTab(page, "OCR 调试")
+
+    def _make_bank_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        row = QHBoxLayout()
+        self.bank_search = QLineEdit()
+        self.bank_search.setPlaceholderText("按题干／答案筛选（当前账号 scope，最多 200 条）")
+        self.bank_search.returnPressed.connect(self.refresh_bank)
+        row.addWidget(self.bank_search, stretch=1)
+        row.addWidget(make_button("刷新题库", self.refresh_bank))
+        layout.addLayout(row)
+        self.bank_table = QTableWidget(0, 5)
+        self.bank_table.setHorizontalHeaderLabels(["状态", "题干", "答案", "模型", "更新时间"])
+        self.bank_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.bank_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.bank_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.bank_table, stretch=1)
+        fb = QGroupBox("人工录入真实答题反馈（只对助手已提交的题有效）")
+        fl = QFormLayout(fb)
+        self.attempt_edit = QLineEdit()
+        self.attempt_edit.setPlaceholderText("提交结果返回的 attempt_id")
+        self.outcome_combo = QComboBox()
+        self.outcome_combo.addItem("实际看到答对", "correct")
+        self.outcome_combo.addItem("实际看到答错", "wrong")
+        self.outcome_combo.addItem("结果看不清", "unknown")
+        self.evidence_edit = QLineEdit()
+        self.evidence_edit.setPlaceholderText("填写你在游戏内看到的明确证据")
+        fl.addRow("提交记录", self.attempt_edit)
+        fl.addRow("实际结果", self.outcome_combo)
+        fl.addRow("反馈依据", self.evidence_edit)
+        fl.addRow("", make_button("保存反馈并更新题库", self.save_feedback))
+        layout.addWidget(fb)
+        self.tabs.addTab(page, "本地题库")
+
+    def _make_settings_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        info = QLabel("本地设置仅保存 ADB 路径、设备地址、题库隔离标识和布局文件。不会保存 OpenAI Key。")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.adb_edit = QLineEdit()
+        self.addr_edit = QLineEdit()
+        self.scope_edit = QLineEdit()
+        self.layout_edit = QLineEdit()
+        form = QFormLayout()
+        form.addRow("ADB 可执行文件路径（可留空）", self.adb_edit)
+        form.addRow("实例地址（如 127.0.0.1:端口）", self.addr_edit)
+        form.addRow("账号隔离标识（不要填密码）", self.scope_edit)
+        form.addRow("OCR 布局 JSON", self.layout_edit)
+        layout.addLayout(form)
+        row = QHBoxLayout()
+        self.save_settings_btn = make_button("保存设置", self.save_settings)
+        row.addWidget(self.save_settings_btn)
+        row.addWidget(make_button("查看模拟器接入指南", self.open_guide))
+        row.addStretch()
+        layout.addLayout(row)
+        important = QLabel("设备连接期间不能修改配置；更换模拟器或布局前请先断开。初始 OCR 区域必须在真实画面中校验。")
+        important.setWordWrap(True)
+        layout.addWidget(important)
+        layout.addStretch()
+        self.tabs.addTab(page, "连接设置")
+
+    def _load_settings(self):
+        try:
+            settings = local_settings()
+            for key, widget in (("adb_path", self.adb_edit), ("address", self.addr_edit),
+                                ("account_scope", self.scope_edit), ("layout", self.layout_edit)):
+                widget.setText(settings[key])
+        except Exception as exc:
+            self.log(f"配置读取失败：{exc}")
+
+    def _settings_data(self):
+        return {"adb_path": self.adb_edit.text().strip(), "address": self.addr_edit.text().strip(),
+                "account_scope": self.scope_edit.text().strip(), "layout": self.layout_edit.text().strip()}
+
+    def save_settings(self) -> bool:
+        if self.connected or self.current_busy or self.worker.busy:
+            self.log("请先断开设备并等待任务结束，再修改本地设置。")
+            return False
+        try:
+            save_local_settings(self._settings_data())
+        except Exception as exc:
+            self.log(f"保存配置失败：{exc}")
+            return False
+        self.last_inspection_valid = False
+        self.layout_confirmed.setChecked(False)
+        self.log(f"本地配置已保存：{LOCAL_CONFIG.name}（不包含密钥）。")
+        return True
+
+    def connect_device(self):
+        if self.current_busy or self.connected:
+            return
+        data = self.device_combo.currentData()
+        if isinstance(data, dict):
+            self.adb_edit.setText(data["adb_path"])
+            self.addr_edit.setText(data["address"])
+        if self.save_settings():
+            self.run_command("connect")
+
+    def stop_device(self):
+        self.stopping = True
+        self.worker.stop()
+        self.was_stopped = True
+        self.last_inspection_valid = False
+        self.layout_confirmed.setChecked(False)
+        self._refresh_controls()
+
+    def toggle_preview(self):
+        if self.worker.preview_enabled:
+            self.worker.pause_preview()
+            self.pause_btn.setText("继续画面预览")
+            self.log("实时画面预览已暂停；此操作不会终止进行中的 AI 请求。")
+        else:
+            self.worker.resume_preview()
+            self.pause_btn.setText("暂停画面预览")
+            self.log("实时画面预览已恢复。")
+
+    def answer_params(self, *, execute: bool):
+        if not self.dali_check.isChecked():
+            raise QuizError("没有勾选已实现的大理寺单题模块。")
+        if execute and (not self.last_inspection_valid or not self.layout_confirmed.isChecked()):
+            raise QuizError("请先在当前设备运行 OCR 并核对区域，再勾选布局确认。")
+        if self.ai_enabled.isChecked() and not self.model_edit.text().strip():
+            raise QuizError("已启用 AI，但没有填写 OpenAI 模型 ID。")
+        return {"use_ai": self.ai_enabled.isChecked(), "model": self.model_edit.text().strip(),
+                "api_key": self.key_edit.text(), "execute": execute,
+                "allow_trial": self.allow_trial.isChecked(),
+                "layout_confirmed": execute and self.layout_confirmed.isChecked(),
+                "max_daily_calls": self.max_calls.value()}
+
+    def preview_answer(self):
+        try:
+            params = self.answer_params(execute=False)
+        except QuizError as exc:
+            self.log(str(exc)); return
+        self.run_command("answer", **params)
+
+    def execute_answer(self):
+        try:
+            params = self.answer_params(execute=True)
+        except QuizError as exc:
+            self.log(str(exc)); return
+        confirmation = QMessageBox.question(
+            self, "确认单次点击", "确认已核对当前题目和选项位置？\n\n"
+            "本次最多提交一个答案；AI 可能出错，提交后结果仍需人工确认。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirmation == QMessageBox.StandardButton.Yes:
+            self.run_command("answer", **params)
+
+    def refresh_bank(self):
+        self.run_command("bank", keyword=self.bank_search.text())
+
+    def save_feedback(self):
+        result = self.outcome_combo.currentData()
+        attempt = self.attempt_edit.text().strip()
+        evidence = self.evidence_edit.text().strip()
+        if not attempt or not evidence:
+            self.log("请填写提交记录 attempt_id 和实际看到的证据。")
+            return
+        self.run_command("feedback", attempt_id=attempt, outcome=result, evidence=evidence)
+
+    def run_command(self, command: str, **kwargs):
+        if self.current_busy:
+            self.log("已有任务运行中，请等待或停止。")
+            return
+        self.was_stopped = False
+        if not self.worker.submit(command, **kwargs):
+            self.log("设备工作线程忙碌，无法启动第二个操作。")
+            return
+        self.current_busy = True
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        busy = self.current_busy or self.worker.busy or self.stopping or self.worker.stop_requested
+        self.scan_btn.setEnabled(not busy and not self.connected)
+        self.connect_btn.setEnabled(not busy and not self.connected)
+        self.disconnect_btn.setEnabled(self.connected or busy)
+        for btn in (self.preview_btn, self.execute_btn, self.inspect_btn, self.guard_btn, self.screenshot_btn):
+            btn.setEnabled(self.connected and not busy)
+        self.pause_btn.setEnabled(self.connected)
+        self.save_settings_btn.setEnabled(not busy and not self.connected)
+        for widget in (self.adb_edit, self.addr_edit, self.scope_edit, self.layout_edit):
+            widget.setEnabled(not busy and not self.connected)
+        self.status.setText("执行中…" if busy else ("已连接" if self.connected else "未连接"))
+
+    def on_event(self, kind: str, payload):
+        if kind == "preview":
+            self.show_frame(payload["png"])
+            return
+        if kind == "preview_error":
+            self.log(f"预览暂停：{payload}")
+            return
+        if kind == "stop_requested":
+            self.log("已请求停止：进行中的请求可能需要自然返回，但之后不会再提交点击。")
+            return
+        if kind == "disconnected":
+            self.connected = False
+            self.stopping = False
+            self.current_busy = False
+            self.last_inspection_valid = False
+            self.layout_confirmed.setChecked(False)
+            self.log("模拟器已断开。")
+            self._refresh_controls()
+            return
+        if kind == "worker_stopped":
+            self.log("设备工作线程已退出。")
+            return
+        if kind == "started":
+            self.log("开始操作：" + payload)
+            return
+        if kind == "error":
+            command, message = payload
+            self.current_busy = False
+            self.log(f"{command} 已暂停：{message}")
+            self._refresh_controls()
+            return
+        if kind != "done":
+            return
+        command, result = payload
+        self.current_busy = False
+        if command == "devices":
+            self.device_combo.clear()
+            self.device_combo.addItem("手动配置／选择设备", None)
+            for d in result:
+                self.device_combo.addItem(f"{d['name']} · {d['address']}", d)
+            if len(result) == 1:
+                self.device_combo.setCurrentIndex(1)
+            self.log(f"扫描完成：检测到 {len(result)} 个 Android 实例。")
+        elif command == "connect":
+            self.connected = True
+            self.log("已连接 " + result["address"] + "；开始定时只读截图。")
+        elif command == "capture":
+            self.show_frame(result["png"])
+            self.log(f"截图已保存：{result.get('saved')}；区域框图：{result.get('overlay', '未生成')}")
+        elif command == "inspect":
+            self.show_frame(result["png"])
+            self.last_inspection_valid = bool(result.get("valid"))
+            self.layout_confirmed.setChecked(False)
+            data = {k: v for k, v in result.items() if k != "png"}
+            self.ocr_out.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+            self.log("OCR 识别有效；请核对题目和区域框图后自行确认布局。" if result.get("valid")
+                     else "OCR 未通过严格校验：" + result.get("error", "未知原因"))
+        elif command == "guard":
+            self.log("Maa OCR 界面校验通过。")
+        elif command == "answer":
+            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+            decision = result.get("decision") or {}
+            if result.get("click_sent") and decision.get("attempt_id"):
+                self.attempt_edit.setText(decision["attempt_id"])
+                self.log("已点击一次；并非已答对。请在题库页按游戏实际反馈记录结果。")
+                self.tabs.setCurrentIndex(0)
+            else:
+                self.log("本题仅完成查询／预览，未点击游戏。")
+        elif command == "bank":
+            self.bank_table.setRowCount(len(result))
+            for i, row in enumerate(result):
+                for col, field in enumerate(("status", "stem", "answer_text", "model", "updated_at")):
+                    cell = QTableWidgetItem(str(row.get(field) or ""))
+                    cell.setToolTip(str(row.get("reason") or ""))
+                    self.bank_table.setItem(i, col, cell)
+            self.log(f"题库载入 {len(result)} 条记录（仅当前账号 scope）。")
+        elif command == "feedback":
+            self.log(f"人工反馈已记录：{result['outcome']}；可刷新题库。")
+        self._refresh_controls()
+
+    def show_frame(self, content: bytes):
+        self.raw_preview = content
+        self._rescale_preview()
+
+    def _rescale_preview(self):
+        if not self.raw_preview:
+            return
+        pix = QPixmap()
+        if pix.loadFromData(self.raw_preview):
+            target = self.preview_label.size() - QSize(8, 8)
+            self.preview_label.setPixmap(pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
+                                                   Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "preview_label"):
+            self._rescale_preview()
+
+    def open_diagnostics(self):
+        folder = ROOT / "data/maa/inspection"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def open_guide(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "docs/EMULATOR.md")))
+
+    def log(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if hasattr(self, "logs"):
+            self.logs.appendPlainText(f"[{stamp}] {message}")
+
+    def closeEvent(self, event):
+        # Closing a worker in the middle of an ADB command/paid request is unsafe.
+        if self.current_busy or self.worker.busy or self.stopping or self.worker.stop_requested:
+            QMessageBox.information(self, "操作尚未结束", "请先点击停止 / 断开，等待当前操作返回后关闭窗口。")
+            event.ignore()
+            return
+        self.worker.shutdown()
+        self.worker.thread.join(timeout=3)
+        if self.worker.thread.is_alive():
+            QMessageBox.warning(self, "设备尚未释放", "设备线程仍在停止中，请稍后再关闭。")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QWidget { font-size: 13px; }
+        QMainWindow { background: #f5f7fb; }
+        QLabel#mainTitle { font-size: 23px; font-weight: 750; color: #172554; }
+        QLabel#status { background: #eef2ff; padding: 7px 14px; border-radius: 8px; color: #3730a3; }
+        QGroupBox { border: 1px solid #dbe2ee; border-radius: 10px; margin-top: 14px;
+                    background: #ffffff; padding: 11px 7px 7px; font-weight: 600; }
+        QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; }
+        QPushButton { padding: 7px 10px; background: #e9eefb; border: 1px solid #d1d9ed;
+                      border-radius: 6px; color: #172554; }
+        QPushButton:hover { background: #dce6ff; }
+        QPushButton:disabled { color: #9aa6b8; background: #f1f3f8; }
+        QLineEdit, QComboBox, QSpinBox { padding: 6px; border: 1px solid #cad4e5; border-radius: 6px; }
+        QPlainTextEdit, QTableWidget { background: #fbfcff; border: 1px solid #dbe2ee;
+                                     border-radius: 7px; font-weight: 400; }
+        QLabel#preview { background: #141c31; color: #c6d4f3; border-radius: 8px; }
+        QPlainTextEdit#logs { font-family: Consolas, 'Microsoft YaHei UI', monospace; }
+        QTabWidget::pane { border: 1px solid #dbe2ee; border-radius: 8px; }
+        QTabBar::tab { padding: 9px 15px; margin-right: 2px; }
+        QTabBar::tab:selected { background: #e6edff; border-radius: 6px; }
+    """)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

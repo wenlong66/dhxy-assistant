@@ -1,0 +1,250 @@
+"""Headless orchestration behind the PySide6 GUI.
+
+No PySide6 imports here: this layer can be regression-tested without a desktop.
+No credentials are persisted, and all device I/O is serialized by the GUI worker.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import sqlite3
+import threading
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Callable
+
+from maa_adapter import ROOT, MaaSession, load_config, save_image
+from quiz_core import OpenAIProvider, QuizError, QuizStore, normalize
+from quiz_vision import DeviceLock, Layout, QuizReader, answer_once, join_blocks, parse_fields, write_json
+
+LOCAL_CONFIG = ROOT / "config/local.json"
+USER_SETTINGS = ("adb_path", "address", "account_scope", "layout")
+
+
+def local_settings() -> dict[str, str]:
+    """Safe, local-only configuration. The API secret is NEVER a config field."""
+    base = json.loads((ROOT / "config/connection.example.json").read_text(encoding="utf-8"))
+    if LOCAL_CONFIG.exists():
+        data = json.loads(LOCAL_CONFIG.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict) or set(data) - set(base):
+            raise QuizError("Config contains unknown keys; edit config/local.json manually.")
+        base.update(data)
+    return {name: str(base[name]) for name in USER_SETTINGS}
+
+
+def save_local_settings(data: dict[str, str]):
+    if set(data) != set(USER_SETTINGS) or any(not isinstance(v, str) for v in data.values()):
+        raise QuizError("Invalid GUI configuration fields.")
+    if not data["account_scope"].strip():
+        raise QuizError("Account scope is required (not your password).")
+    if not data["layout"].strip():
+        raise QuizError("Layout path cannot be empty.")
+    # Round-trip through the original validation rules before committing the config.
+    existing = json.loads((ROOT / "config/connection.example.json").read_text(encoding="utf-8"))
+    if LOCAL_CONFIG.exists():
+        supplied = json.loads(LOCAL_CONFIG.read_text(encoding="utf-8-sig"))
+        if not isinstance(supplied, dict) or set(supplied) - set(existing):
+            raise QuizError("Invalid current config; do not overwrite unknown keys.")
+        existing.update(supplied)
+    existing.update(data)
+    target = LOCAL_CONFIG
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(".json.tmp")
+    try:
+        temp.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        load_config(temp)
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def preview_png(frame) -> bytes:
+    """Convert the copied BGR screenshot to a PNG; no raw screenshot is transmitted."""
+    from PIL import Image
+    out = io.BytesIO()
+    Image.fromarray(frame[:, :, ::-1]).save(out, format="PNG")
+    return out.getvalue()
+
+
+def query_bank(path: Path, scope: str, keyword: str = "", limit: int = 200):
+    """Read-only table; only the first 200 records are shown to avoid GUI stalls."""
+    if not path.exists():
+        return []
+    # Use read-only access: opening the UI must not silently modify quiz storage.
+    uri = path.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        # Parameterized search, escaping SQL wildcard characters.
+        search = keyword.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = con.execute("""
+            SELECT qkey, status, stem, answer_text, reason, model, updated_at
+              FROM answers WHERE scope=?
+                AND (stem LIKE ? ESCAPE '\\' OR answer_text LIKE ? ESCAPE '\\')
+              ORDER BY updated_at DESC LIMIT ?
+        """, (scope, f"%{search}%", f"%{search}%", limit)).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+class DeviceBackend:
+    """One connected emulator at a time; called only on one background thread."""
+
+    def __init__(self, session_factory=MaaSession):
+        self.session_factory = session_factory
+        self.session = None
+        self.cfg: dict[str, Any] | None = None
+        self.lock: DeviceLock | None = None
+        self.connected_address: str = ""
+
+    def _config(self):
+        return load_config(LOCAL_CONFIG if LOCAL_CONFIG.exists() else None)
+
+    def devices(self) -> list[dict]:
+        # Discovery does not connect and must not acquire the device lock.
+        if self.session is not None:
+            return self.session.device_list()
+        temporary = self.session_factory(self._config(), execute=False)
+        try:
+            return temporary.device_list()
+        finally:
+            temporary.close()
+
+    def connect(self):
+        if self.session is not None:
+            raise QuizError("Already connected. Disconnect before changing devices.")
+        cfg = self._config()
+        lock = DeviceLock(cfg["database"].with_suffix(".device.lock"))
+        lock.__enter__()
+        session = None
+        try:
+            # The class has a dry-run default; explicit single-answer permission is
+            # enforced by the worker before enabling it on this session.
+            session = self.session_factory(cfg, execute=False)
+            session.connect()
+            self.session, self.cfg, self.lock = session, cfg, lock
+            self.connected_address = session.address
+            return {"address": session.address}
+        except BaseException:
+            if session is not None:
+                session.close()
+            lock.__exit__(None, None, None)
+            raise
+
+    def disconnect(self):
+        try:
+            if self.session is not None:
+                self.session.close()
+        finally:
+            self.session = None
+            self.cfg = None
+            self.connected_address = ""
+            if self.lock is not None:
+                self.lock.__exit__(None, None, None)
+                self.lock = None
+
+    def _need_session(self):
+        if self.session is None or self.cfg is None:
+            raise QuizError("Please connect an Android emulator first.")
+        return self.session, self.cfg
+
+    def capture(self, *, save=False, overlay=False) -> dict:
+        session, cfg = self._need_session()
+        frame = session.capture()
+        height, width = frame.shape[:2]
+        result = {"png": preview_png(frame), "width": width, "height": height, "address": session.address}
+        if save:
+            output = cfg["runtime_dir"] / "gui/capture.png"
+            save_image(frame, output)
+            result["saved"] = str(output)
+        if overlay:
+            layout = Layout.load(cfg["layout"])
+            rois = layout.scaled(width, height)
+            output = cfg["runtime_dir"] / "gui/capture-overlay.png"
+            save_image(frame, output, rois)
+            result["overlay"] = str(output)
+        return result
+
+    def inspect(self) -> dict:
+        session, cfg = self._need_session()
+        layout = Layout.load(cfg["layout"])
+        reader = QuizReader(session, layout, cfg["account_scope"])
+        frame, captured, fields, rois = reader.inspect()
+        folder = cfg["runtime_dir"] / "inspection"
+        save_image(frame, folder / "screen.png")
+        save_image(frame, folder / "overlay.png", rois)
+        result = {"fields": {name: [asdict(b) for b in blocks] for name, blocks in fields.items()},
+                  "valid": False, "ai_called": False, "click_sent": False,
+                  "png": preview_png(frame), "width": frame.shape[1], "height": frame.shape[0],
+                  "overlay": str(folder / "overlay.png"), "diagnostics": str(folder)}
+        try:
+            obs = parse_fields(fields, layout, (frame.shape[1], frame.shape[0]),
+                               session.address, cfg["account_scope"], captured)
+            result.update(valid=True, question={"stem": obs.question.stem,
+                                               "options": dict(obs.question.options)})
+        except QuizError as exc:
+            result["error"] = str(exc)
+        # Exclude PNG bytes from the diagnostic JSON file.
+        write_json(folder / "ocr.json", {k: v for k, v in result.items() if k != "png"})
+        return result
+
+    def guard(self) -> dict:
+        session, cfg = self._need_session()
+        frame = session.capture()
+        layout = Layout.load(cfg["layout"])
+        title = layout.scaled(frame.shape[1], frame.shape[0])["title"]
+        session.guard_scene(title)
+        # A completed pipeline job alone is insufficient proof of an OCR match.
+        text = join_blocks(session.ocr(frame, title, single_line=True), layout.minimum)
+        if normalize(text) != "大理寺答题":
+            raise QuizError("Scene guard did not find the exact Dali quiz title.")
+        return {"matched": True, "pipeline": "DaliSceneGuard"}
+
+    def answer(self, *, use_ai=False, model="", api_key="", execute=False,
+               allow_trial=False, layout_confirmed=False, max_daily_calls=30,
+               should_stop: Callable[[], bool] | None = None) -> dict:
+        session, cfg = self._need_session()
+        if execute and not layout_confirmed:
+            raise QuizError("Inspect and explicitly confirm the screenshot layout before submitting.")
+        if use_ai and not model.strip():
+            raise QuizError("Choose an OpenAI model before permitting paid API calls.")
+        if should_stop is not None and should_stop():
+            raise QuizError("Cancelled before starting; no API call/click made.")
+        session.execute = bool(execute)
+        store = QuizStore(cfg["database"])
+        try:
+            provider = OpenAIProvider(model=model, api_key=api_key or None) if use_ai else None
+            reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
+            return answer_once(reader, session, store, provider=provider, execute=execute,
+                               layout_confirmed=layout_confirmed, allow_trial=allow_trial,
+                               max_daily_calls=max_daily_calls,
+                               receipt_dir=cfg["runtime_dir"] / "receipts",
+                               should_stop=should_stop)
+        finally:
+            session.execute = False
+            store.close()
+
+    def bank(self, keyword="") -> list[dict]:
+        cfg = self._config()
+        return query_bank(cfg["database"], cfg["account_scope"], keyword)
+
+    def feedback(self, attempt_id: str, outcome: str, evidence: str):
+        if not attempt_id or outcome not in {"correct", "wrong", "unknown"} or not evidence.strip():
+            raise QuizError("Feedback requires an attempt, an outcome and observed evidence.")
+        cfg = self._config()
+        store = QuizStore(cfg["database"])
+        try:
+            # GUI only accepts outcomes for attempts actually submitted via our adapter.
+            row = store.db.execute("SELECT submitted_at, outcome FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            if row is None or row["submitted_at"] is None:
+                raise QuizError("This attempt was never submitted by the assistant; cannot confirm in GUI.")
+            store.feedback(attempt_id, outcome, evidence, source="manual")
+            return {"attempt_id": attempt_id, "outcome": outcome}
+        finally:
+            store.close()
+
+    def shutdown(self):
+        self.disconnect()

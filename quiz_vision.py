@@ -160,18 +160,27 @@ def write_json(path: Path, data):
 
 def answer_once(reader, session, store: QuizStore, *, provider=None, execute=False,
                 layout_confirmed=False, allow_trial=False, max_daily_calls=30,
-                receipt_dir: Path = Path("data/receipts"), sleep=time.sleep):
+                receipt_dir: Path = Path("data/receipts"), sleep=time.sleep,
+                should_stop=None):
+    def require_active():
+        if should_stop is not None and should_stop():
+            raise QuizError("Operation cancelled; no game click sent.")
+
+    require_active()
     if execute and not layout_confirmed:
         raise QuizError("Inspect the overlay/OCR first, then explicitly pass --layout-confirmed.")
     first = reader.read()
     sleep(0.25)
     stable = reader.read()
     assert_same(first, stable)
+    require_active()
     decision = store.resolve(stable.question, provider, allow_trial=allow_trial,
                              max_daily_calls=max_daily_calls)
+    require_active()  # Especially important after the potentially slow, paid API request.
     result = {"decision": decision.to_dict(), "click_sent": False, "outcome": "not_submitted"}
     if not execute or not decision.can_submit:
         return result
+    require_active()
     # AI may take time; never use an old frame or letter-to-button mapping.
     current = reader.read()
     assert_same(stable, current)
@@ -189,9 +198,11 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     result.update(target=list(point), outcome="prepared", question_key=final.question.key)
     # Persist intent before claiming or touching the game; disk errors must prevent a click.
     write_json(receipt, result)
+    require_active()
     if not store.claim_submission(decision, final.question):
         raise QuizError("Submission guard rejected this view: already submitted, stale or awaiting feedback.")
     try:
+        require_active()
         session.click(*point)
     except BaseException:
         store.feedback(decision.attempt_id, "unknown", "Click interrupted/failed; delivery cannot be determined.", source="game_ui")

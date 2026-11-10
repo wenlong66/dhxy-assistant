@@ -1,13 +1,18 @@
 # DHXY Assistant — 大话西游手游个人辅助
 
-当前版本：**v0.2.0 — MaaFramework / Android ADB / 本地 OCR 集成初版**。
+当前版本：**v0.3.0 — Windows GUI（PySide6）+ MaaFramework / Android ADB / OCR**。
 
-新增真实设备适配代码：设备发现与连接、截图、区域预览、Maa OCR、题库/AI 衔接、
-提交前画面复核和显式单题点击。**不是已经实机验收的完整日常助手，也不是 Windows 安装包。**
+新增 **Windows 可操作 GUI**：`gui_app.py`，提供模拟器扫描连接、约两秒刷新一次的画面预览、
+OCR 调试、OpenAI 配置（密钥仅内存）、本地题库和人工反馈，支持显式单次提交。
+**双击安装与启动：`setup_gui.bat` → `start_gui.bat`。**
+详细步骤：[docs/GUI.md](docs/GUI.md)。
+
+已有真实设备适配代码：设备发现与连接、截图、区域预览、Maa OCR、题库/AI 衔接、
+提交前画面复核和显式单题点击。**不是已经实机验收的完整日常助手，也不是打包好的 Windows 安装程序。**
 你仍需手动登录游戏、进入大理寺题目；本版不自动答完十题，也不自动识别答对/答错。
 
 **Windows 接入步骤：[docs/EMULATOR.md](docs/EMULATOR.md)**  
-**测试范围：[docs/VALIDATION.md](docs/VALIDATION.md)**（93 项离线测试；没有真实模拟器/OCR 推理测试）。
+**测试范围：[docs/VALIDATION.md](docs/VALIDATION.md)**（离线测试；没有真实 Windows GUI、模拟器或 OCR 推理测试）。
 
 ```powershell
 py -3.11 -m venv .venv
@@ -42,7 +47,7 @@ $PY = ".\.venv\Scripts\python.exe"
 - 可明确选择上传一张用户已裁好的题目图片；默认只传题干和选项文本。
 - API Key 从本机进程环境或本机终端隐藏输入读取，不写进数据库或源码。
 
-**尚未包含**：自动反馈识别、完整十题循环、日常任务导航、GUI、游戏实测、在线搜索题库、自动模型升级。独立核心输入 JSON 的 `scene` 标签不代表真实画面已通过检测；设备入口另做标题/标签/题号校验。
+**尚未包含**：自动反馈识别、完整十题循环、日常任务导航、游戏实测、在线搜索题库、自动模型升级。独立核心输入 JSON 的 `scene` 标签不代表真实画面已通过检测；设备入口另做标题/标签/题号校验。
 
 ## 运行
 
