@@ -1,8 +1,8 @@
 {
   "DaliSceneGuard": {
     "recognition": "OCR",
-    "expected": ["大理寺答题"],
-    "roi": [344, 65, 182, 31],
+    "expected": ["第\\s*\\d+\\s*/\\s*\\d+\\s*题"],
+    "roi": [279, 155, 353, 78],
     "threshold": 0.8,
     "action": "DoNothing",
     "timeout": 1500

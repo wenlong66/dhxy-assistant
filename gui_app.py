@@ -17,7 +17,7 @@ try:
     from PySide6.QtCore import QObject, Qt, Signal, QSize, QUrl
     from PySide6.QtGui import QDesktopServices, QPixmap
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFormLayout, QFrame, QGroupBox,
+        QApplication, QCheckBox, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
         QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
         QPlainTextEdit, QScrollArea, QSpinBox, QSplitter, QTabWidget,
         QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
@@ -137,6 +137,13 @@ class DeviceWorker:
                         result = backend.guard()
                     elif command == "answer":
                         result = backend.answer(should_stop=self.cancelled.is_set, **args)
+                    elif command == "auto_answer":
+                        def auto_progress(answer):
+                            self.bridge.message.emit("auto_progress", answer)
+                            self.bridge.message.emit("preview", backend.capture())
+                        result = backend.auto_answer(
+                            should_stop=self.cancelled.is_set,
+                            on_result=auto_progress, **args)
                     elif command == "bank":
                         result = backend.bank(args.get("keyword", ""))
                     elif command == "feedback":
@@ -184,12 +191,17 @@ class MainWindow(QMainWindow):
         self.last_inspection_valid = False
         self._make_ui()
         self._load_settings()
-        self.log("GUI 已启动。默认只读；仅大理寺单题预览和显式单次提交可用。")
+        self.log("GUI 已启动。连接后可预览单题、提交一次或启动大理寺自动答题。")
         self._refresh_controls()
 
     def _make_ui(self):
         root = QWidget()
-        self.setCentralWidget(root)
+        root.setObjectName("mainContent")
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
         main = QVBoxLayout(root)
         main.setContentsMargins(16, 12, 16, 12)
         main.setSpacing(12)
@@ -231,7 +243,7 @@ class MainWindow(QMainWindow):
         self.logs.setObjectName("logs")
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(500)
-        self.logs.setMinimumHeight(120)
+        self.logs.setFixedHeight(120)
         log_layout.addWidget(self.logs)
         main.addWidget(log_group)
 
@@ -240,27 +252,34 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(page)
         left = QVBoxLayout()
         right = QVBoxLayout()
-        layout.addLayout(left, 2)
-        layout.addLayout(right, 3)
+        layout.addLayout(left, 3)
+        layout.addLayout(right, 1)
+        settings_row = QHBoxLayout()
+        left.addLayout(settings_row)
 
         tasks = QGroupBox("任务选择")
         task_l = QVBoxLayout(tasks)
-        self.dali_check = QCheckBox("大理寺答题（仅单题；已接入）")
+        self.dali_check = QCheckBox("大理寺答题（单题／自动；已接入）")
         self.dali_check.setChecked(True)
         task_l.addWidget(self.dali_check)
         for item in ("师门任务（尚未接入）", "帮派任务（尚未接入）", "宝图任务（尚未接入）", "五环任务（尚未接入）"):
             check = QCheckBox(item)
             check.setEnabled(False)
             task_l.addWidget(check)
-        task_l.addWidget(QLabel("目前不支持一键完成全部日常，无法自动进入题目场景。"))
-        left.addWidget(tasks)
+        task_note = QLabel("目前不支持一键完成全部日常，无法自动进入题目场景。")
+        task_note.setWordWrap(True)
+        task_l.addWidget(task_note)
+        settings_row.addWidget(tasks, 1)
 
         options = QGroupBox("答题控制")
         options_l = QVBoxLayout(options)
         self.ai_enabled = QCheckBox("题库未命中时询问 OpenAI（可能产生费用）")
         self.allow_trial = QCheckBox("允许试答尚未验证的 AI 候选")
+        self.random_answer = QCheckBox("随机答题（不查题库、不调用 AI）")
+        self.random_answer.toggled.connect(self.ai_enabled.setDisabled)
+        self.random_answer.toggled.connect(self.allow_trial.setDisabled)
         self.layout_confirmed = QCheckBox("已核对本设备 OCR、选项位置与区域框图")
-        for ch in (self.ai_enabled, self.allow_trial, self.layout_confirmed):
+        for ch in (self.random_answer, self.ai_enabled, self.allow_trial, self.layout_confirmed):
             options_l.addWidget(ch)
         self.model_edit = QLineEdit(os.environ.get("OPENAI_MODEL", ""))
         self.model_edit.setPlaceholderText("API 模型 ID（仅开启 AI 时需要）")
@@ -277,14 +296,17 @@ class MainWindow(QMainWindow):
         max_row.addWidget(self.max_calls)
         max_row.addStretch()
         options_l.addLayout(max_row)
-        left.addWidget(options)
+        settings_row.addWidget(options, 2)
 
         controls = QHBoxLayout()
-        self.preview_btn = make_button("开始 / 预览本题答案", self.preview_answer)
+        self.preview_btn = make_button("预览本题答案", self.preview_answer)
         self.execute_btn = make_button("提交本题一次", self.execute_answer)
+        self.auto_btn = make_button("开始自动答题", self.start_auto_answer)
+        self.auto_btn.setToolTip("勾选随机则连续随机提交；否则题库优先，未命中用 AI 并提交。")
         self.pause_btn = make_button("暂停画面预览", self.toggle_preview)
         controls.addWidget(self.preview_btn)
         controls.addWidget(self.execute_btn)
+        controls.addWidget(self.auto_btn)
         controls.addWidget(self.pause_btn)
         left.addLayout(controls)
 
@@ -300,18 +322,21 @@ class MainWindow(QMainWindow):
         vl = QVBoxLayout(video_box)
         self.preview_label = QLabel("请先扫描并连接 Android 模拟器")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(460, 290)
+        self.preview_label.setMinimumSize(280, 158)
+        self.preview_label.setMaximumHeight(220)
+        self.preview_label.setWordWrap(True)
         self.preview_label.setObjectName("preview")
         vl.addWidget(self.preview_label, stretch=1)
-        row = QHBoxLayout()
+        row = QGridLayout()
         self.screenshot_btn = make_button("保存截图和区域框图", lambda: self.run_command("capture"))
         self.inspect_btn = make_button("OCR 识别当前题", lambda: self.run_command("inspect"))
         self.guard_btn = make_button("校验答题界面", lambda: self.run_command("guard"))
-        row.addWidget(self.screenshot_btn)
-        row.addWidget(self.inspect_btn)
-        row.addWidget(self.guard_btn)
+        row.addWidget(self.screenshot_btn, 0, 0, 1, 2)
+        row.addWidget(self.inspect_btn, 1, 0)
+        row.addWidget(self.guard_btn, 1, 1)
         vl.addLayout(row)
-        right.addWidget(video_box, stretch=1)
+        right.addWidget(video_box)
+        right.addStretch()
         self.tabs.addTab(page, "任务与画面")
 
     def _make_ocr_tab(self):
@@ -446,16 +471,20 @@ class MainWindow(QMainWindow):
             self.pause_btn.setText("暂停画面预览")
             self.log("实时画面预览已恢复。")
 
-    def answer_params(self, *, execute: bool):
+    def answer_params(self, *, execute: bool, automatic=False):
         if not self.dali_check.isChecked():
-            raise QuizError("没有勾选已实现的大理寺单题模块。")
-        if execute and (not self.last_inspection_valid or not self.layout_confirmed.isChecked()):
-            raise QuizError("请先在当前设备运行 OCR 并核对区域，再勾选布局确认。")
-        if self.ai_enabled.isChecked() and not self.model_edit.text().strip():
-            raise QuizError("已启用 AI，但没有填写 OpenAI 模型 ID。")
-        return {"use_ai": self.ai_enabled.isChecked(), "model": self.model_edit.text().strip(),
+            raise QuizError("没有勾选已实现的大理寺答题模块。")
+        if execute and not self.last_inspection_valid:
+            raise QuizError("题目 OCR 尚未通过：请点击「OCR 识别当前题」，到「OCR 调试」查看题号、题干和选项的识别结果。")
+        if execute and not self.layout_confirmed.isChecked():
+            raise QuizError("题目 OCR 已通过，请核对题干、全部选项及区域框图，再勾选布局确认。")
+        use_ai = (automatic or self.ai_enabled.isChecked()) and not self.random_answer.isChecked()
+        if use_ai and not self.model_edit.text().strip():
+            raise QuizError("按题作答需要填写 OpenAI 模型 ID。")
+        return {"use_ai": use_ai, "model": self.model_edit.text().strip(),
                 "api_key": self.key_edit.text(), "execute": execute,
-                "allow_trial": self.allow_trial.isChecked(),
+                "random_answer": self.random_answer.isChecked(),
+                "allow_trial": automatic or self.allow_trial.isChecked(),
                 "layout_confirmed": execute and self.layout_confirmed.isChecked(),
                 "max_daily_calls": self.max_calls.value()}
 
@@ -473,11 +502,26 @@ class MainWindow(QMainWindow):
             self.log(str(exc)); return
         confirmation = QMessageBox.question(
             self, "确认单次点击", "确认已核对当前题目和选项位置？\n\n"
-            "本次最多提交一个答案；AI 可能出错，提交后结果仍需人工确认。",
+            "本次最多提交一个答案；随机或 AI 答案可能出错，提交后结果仍需人工确认。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if confirmation == QMessageBox.StandardButton.Yes:
             self.run_command("answer", **params)
+
+    def start_auto_answer(self):
+        try:
+            params = self.answer_params(execute=True, automatic=True)
+        except QuizError as exc:
+            self.log(str(exc)); return
+        mode = ("连续随机选择答案并提交。" if params["random_answer"] else
+                "题库优先，未命中时调用 AI 并自动提交候选答案，可能产生 API 费用。")
+        confirmation = QMessageBox.question(
+            self, "开始自动答题", mode + "\n\n将从当前题连续答到本轮最后一题。"
+            "答案可能出错，不会自动标记答对。\n点击「断开 / 停止」可中止后续提交。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirmation == QMessageBox.StandardButton.Yes:
+            self.run_command("auto_answer", **params)
 
     def refresh_bank(self):
         self.run_command("bank", keyword=self.bank_search.text())
@@ -507,15 +551,27 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(not busy and not self.connected)
         self.connect_btn.setEnabled(not busy and not self.connected)
         self.disconnect_btn.setEnabled(self.connected or busy)
-        for btn in (self.preview_btn, self.execute_btn, self.inspect_btn, self.guard_btn, self.screenshot_btn):
+        for btn in (self.preview_btn, self.execute_btn, self.auto_btn, self.inspect_btn, self.guard_btn, self.screenshot_btn):
             btn.setEnabled(self.connected and not busy)
         self.pause_btn.setEnabled(self.connected)
         self.save_settings_btn.setEnabled(not busy and not self.connected)
+        self.random_answer.setEnabled(not busy)
+        self.ai_enabled.setEnabled(not busy and not self.random_answer.isChecked())
+        self.allow_trial.setEnabled(not busy and not self.random_answer.isChecked())
+        for widget in (self.model_edit, self.key_edit, self.max_calls, self.layout_confirmed):
+            widget.setEnabled(not busy)
         for widget in (self.adb_edit, self.addr_edit, self.scope_edit, self.layout_edit):
             widget.setEnabled(not busy and not self.connected)
         self.status.setText("执行中…" if busy else ("已连接" if self.connected else "未连接"))
 
     def on_event(self, kind: str, payload):
+        if kind == "auto_progress":
+            self.answer_out.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+            attempt = (payload.get("decision") or {}).get("attempt_id")
+            if attempt:
+                self.attempt_edit.setText(attempt)
+            self.log(f"自动答题：已提交第 {payload['question_number']}/{payload['question_total']} 题，结果仍需核实。")
+            return
         if kind == "preview":
             self.show_frame(payload["png"])
             return
@@ -573,7 +629,9 @@ class MainWindow(QMainWindow):
             self.log("OCR 识别有效；请核对题目和区域框图后自行确认布局。" if result.get("valid")
                      else "OCR 未通过严格校验：" + result.get("error", "未知原因"))
         elif command == "guard":
-            self.log("Maa OCR 界面校验通过。")
+            self.last_inspection_valid = True
+            self.layout_confirmed.setChecked(False)
+            self.log("题号、题干和选项校验通过；核对布局后勾选确认即可提交。")
         elif command == "answer":
             self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
             decision = result.get("decision") or {}
@@ -583,6 +641,9 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(0)
             else:
                 self.log("本题仅完成查询／预览，未点击游戏。")
+        elif command == "auto_answer":
+            state = "本轮最后一题已提交" if result["reason"] == "completed" else "已停止"
+            self.log(f"自动答题{state}；本次共提交 {result['submitted']} 题，未自动判定对错。")
         elif command == "bank":
             self.bank_table.setRowCount(len(result))
             for i, row in enumerate(result):
@@ -646,7 +707,7 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget { font-size: 13px; }
-        QMainWindow { background: #f5f7fb; }
+        QMainWindow, QWidget#mainContent { background: #f5f7fb; }
         QLabel#mainTitle { font-size: 23px; font-weight: 750; color: #172554; }
         QLabel#status { background: #eef2ff; padding: 7px 14px; border-radius: 8px; color: #3730a3; }
         QGroupBox { border: 1px solid #dbe2ee; border-radius: 10px; margin-top: 14px;

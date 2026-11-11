@@ -35,7 +35,7 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 def load_maa():
     try:
         from importlib.metadata import version
-        if version("maafw") != MAA_VERSION:
+        if version("maafw").removeprefix("v") != MAA_VERSION:
             raise QuizError(f"Use maafw=={MAA_VERSION}; this adapter pins the Python API.")
         from maa.controller import AdbController
         from maa.define import MaaAdbScreencapMethodEnum, MaaAdbInputMethodEnum

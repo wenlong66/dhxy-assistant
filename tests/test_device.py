@@ -10,15 +10,15 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
-from maa_adapter import ROOT, MaaSession, load_config, select_device, wait_job
+from maa_adapter import ROOT, MaaSession, load_config, load_maa, select_device, wait_job
 from quiz_core import AIAnswer, QuizError, QuizStore
-from quiz_vision import (DeviceLock, Layout, TextBlock, answer_once, assert_same,
+from quiz_vision import (DeviceLock, Layout, QuizReader, TextBlock, answer_once, assert_same,
                          join_blocks, parse_fields)
 from setup_ocr import verify_file, verify_models
 
 
 def fields():
-    text = {"title": "大理寺答题", "question": "第1/10题：测试等级为34级，不正确的是？"}
+    text = {"question": "第1/10题：测试等级为34级，不正确的是？"}
     text.update({f"label_{k}": k for k in "ABCD"})
     text.update({f"option_{k}": v for k, v in zip("ABCD", ["甲", "乙", "丙", "丁"])})
     return {k: [TextBlock(v, 0.99, (0, 0, 80, 20))] for k, v in text.items()}
@@ -34,13 +34,47 @@ class LayoutTests(unittest.TestCase):
         self.layout = Layout.load(ROOT / "config/dali.layout.json")
 
     def test_reference_rectangles(self):
-        self.assertEqual(self.layout.scaled(834, 470)["title"], (344, 65, 182, 31))
+        self.assertEqual(self.layout.scaled(834, 470)["question"], (279, 155, 353, 78))
 
     def test_double_resolution(self):
-        self.assertEqual(self.layout.scaled(1668, 940)["title"], (688, 130, 364, 62))
+        self.assertEqual(self.layout.scaled(1668, 940)["question"], (558, 310, 706, 156))
 
     def test_normal_720p(self):
         self.assertEqual(set(self.layout.scaled(1280, 720)), set(fields()))
+
+    def test_parse_two_options_without_lower_buttons(self):
+        data = fields()
+        for label in "CD":
+            data[f"label_{label}"] = [TextBlock("-", 0.3, (0, 0, 20, 20))]
+            data[f"option_{label}"] = []
+        result = observation(data=data)
+        self.assertEqual(tuple(dict(result.question.options)), ("A", "B"))
+        self.assertEqual(set(result.buttons), {"A", "B"})
+        data["option_C"] = [TextBlock("丙", 0.5, (0, 0, 20, 20))]
+        with self.assertRaises(QuizError):
+            observation(data=data)
+
+    def test_parse_three_options_and_reject_partial_fourth(self):
+        data = fields()
+        data["label_D"] = [TextBlock("-", 0.3, (0, 0, 20, 20))]
+        data["option_D"] = []
+        result = observation(data=data)
+        self.assertEqual(tuple(dict(result.question.options)), ("A", "B", "C"))
+        self.assertEqual(set(result.buttons), {"A", "B", "C"})
+        data["option_D"] = [TextBlock("丁", 0.5, (0, 0, 20, 20))]
+        with self.assertRaises(QuizError):
+            observation(data=data)
+
+    def test_reader_never_recognizes_legacy_title_region(self):
+        self.layout.data["regions"]["title"] = [348, 70, 136, 24]
+        rois = self.layout.scaled(834, 470)
+        self.assertNotIn("title", rois)
+        def ocr(frame, roi, *, single_line=False):
+            name = next(k for k, rect in rois.items() if rect == roi)
+            self.assertNotEqual(name, "title")
+            return fields()[name]
+        session = NS(capture=lambda: NS(shape=(470, 834, 3)), ocr=ocr, address="test-device")
+        self.assertEqual(len(QuizReader(session, self.layout, "test-profile").read().question.options), 4)
 
     def test_reject_portrait(self):
         with self.assertRaises(QuizError): self.layout.scaled(720, 1280)
@@ -50,7 +84,7 @@ class LayoutTests(unittest.TestCase):
 
     def test_reject_out_of_bounds(self):
         data = copy.deepcopy(self.layout.data)
-        data["regions"]["title"] = [830, 10, 30, 30]
+        data["regions"]["question"] = [830, 10, 30, 30]
         with self.assertRaises(QuizError): Layout(data)
 
     def test_reject_missing_option_region(self):
@@ -97,9 +131,9 @@ class ParsingTests(unittest.TestCase):
         data = fields(); data["option_B"] = data["option_A"]
         with self.assertRaises(QuizError): observation(data=data)
 
-    def test_wrong_title_rejected(self):
-        data = fields(); data["title"] = [TextBlock("安全验证", .99, (0, 0, 100, 20))]
-        with self.assertRaises(QuizError): observation(data=data)
+    def test_title_announcements_do_not_affect_question(self):
+        data = fields(); data["title"] = [TextBlock("滚动公告", .1, (0, 0, 100, 20))]
+        self.assertEqual(len(observation(data=data).question.options), 4)
 
     def test_wrong_label_rejected(self):
         data = fields(); data["label_D"] = data["label_C"]
@@ -160,10 +194,56 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["decision"]["status"], "miss")
         self.assertEqual(self.provider.calls, 0)
 
+    def test_random_preview_and_submit_reuse_choice_without_ai_or_bank(self):
+        with patch("quiz_core.random.choice", return_value=("A", "甲")) as choose:
+            preview = self.run_answer(random_answer=True)
+            self.assertFalse(preview["click_sent"])
+            submitted = self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
+        self.assertEqual(choose.call_count, 1)
+        self.assertEqual(preview["decision"]["answer_text"], submitted["decision"]["answer_text"])
+        self.assertEqual(submitted["decision"]["origin"], "random")
+        self.session.click.assert_called_once_with(363, 279)
+        self.assertEqual(self.provider.calls, 0)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 0)
+        self.store.feedback(submitted["decision"]["attempt_id"], "correct", "Test feedback")
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+
+    def test_random_still_requires_layout_and_blocks_repeat_clicks(self):
+        with self.assertRaises(QuizError):
+            self.run_answer(random_answer=True, execute=True)
+        self.reader.read.assert_not_called()
+        self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
+        with self.assertRaises(QuizError):
+            self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
+        self.assertEqual(self.session.click.call_count, 1)
+
+    def test_two_and_three_option_random_submission_only_clicks_existing_buttons(self):
+        for count, point in ((2, (548, 279)), (3, (363, 346))):
+            with self.subTest(count=count):
+                data = fields()
+                for label in "ABCD"[count:]:
+                    data[f"label_{label}"] = []
+                    data[f"option_{label}"] = []
+                self.reader.read.side_effect = lambda: observation(data=data)
+                self.session.click.reset_mock()
+                label = "ABCD"[count - 1]
+                with patch("quiz_core.random.choice", return_value=(label, "甲乙丙丁"[count - 1])):
+                    result = self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
+                self.assertEqual(result["decision"]["label"], label)
+                self.session.click.assert_called_once_with(*point)
+                self.assertEqual(self.provider.calls, 0)
+
     def test_execute_requires_calibration_ack(self):
         with self.assertRaises(QuizError): self.run_answer(execute=True)
         self.reader.read.assert_not_called()
         self.assertEqual(self.provider.calls, 0)
+
+    def test_auto_expected_question_change_prevents_ai_and_click(self):
+        with self.assertRaises(QuizError):
+            self.run_answer(execute=True, layout_confirmed=True, expected_view_token="previous-question")
+        self.assertEqual(self.provider.calls, 0)
+        self.session.click.assert_not_called()
 
     def test_candidate_needs_trial_opt_in(self):
         result = self.run_answer(execute=True, layout_confirmed=True)
@@ -220,6 +300,29 @@ class ExecutionTests(unittest.TestCase):
             with self.assertRaises(OSError): self.run_answer(execute=True, layout_confirmed=True, allow_trial=True)
         self.session.click.assert_not_called()
         self.assertIsNone(self.store.db.execute("SELECT submitted_at FROM attempts").fetchone()[0])
+
+
+class MaaVersionTests(unittest.TestCase):
+    def test_pinned_version_accepts_optional_v_prefix(self):
+        toolkit = object()
+        modules = {
+            "maa.controller": NS(AdbController=object()),
+            "maa.define": NS(MaaAdbScreencapMethodEnum=object(), MaaAdbInputMethodEnum=object()),
+            "maa.pipeline": NS(JOCR=object()),
+            "maa.resource": NS(Resource=object()),
+            "maa.tasker": NS(Tasker=object()),
+            "maa.toolkit": NS(Toolkit=toolkit),
+        }
+        with patch.dict("sys.modules", modules):
+            for installed in ("5.15.0", "v5.15.0"):
+                with self.subTest(installed=installed), patch("importlib.metadata.version", return_value=installed):
+                    self.assertIs(load_maa()["Toolkit"], toolkit)
+
+    def test_other_versions_still_rejected(self):
+        for installed in ("5.14.0", "v5.16.0", "5.15.0rc1"):
+            with self.subTest(installed=installed), patch("importlib.metadata.version", return_value=installed):
+                with self.assertRaisesRegex(QuizError, "Use maafw==5.15.0"):
+                    load_maa()
 
 
 class AdapterTests(unittest.TestCase):

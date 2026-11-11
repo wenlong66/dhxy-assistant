@@ -86,8 +86,8 @@ def main(argv=None):
             emit(info)
             return 0
         if args.command == "guard":
-            frame = session.capture()
-            session.guard_scene(layout.scaled(frame.shape[1], frame.shape[0])["title"])
+            observation = QuizReader(session, layout, cfg["account_scope"]).read()
+            session.guard_scene(layout.scaled(*observation.size)["question"])
             emit({"pipeline": "DaliSceneGuard", "matched": True, "click_sent": False})
             return 0
         reader = QuizReader(session, layout, cfg["account_scope"])

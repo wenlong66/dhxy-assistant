@@ -46,9 +46,9 @@ class Layout:
         self.tolerance = float(data["aspect_tolerance"])
         if not 0.5 <= self.minimum <= 1 or not 0 <= self.tolerance <= 0.1:
             raise QuizError("Unsafe OCR threshold or aspect tolerance.")
-        required = {"title", "question", *[f"label_{k}" for k in "ABCD"], *[f"option_{k}" for k in "ABCD"]}
-        if set(data["regions"]) != required or set(data["buttons"]) != set("ABCD"):
-            raise QuizError("Layout needs title/question and all four option/label/button regions.")
+        required = {"question", *[f"label_{k}" for k in "ABCD"], *[f"option_{k}" for k in "ABCD"]}
+        if set(data["regions"]) not in (required, required | {"title"}) or set(data["buttons"]) != set("ABCD"):
+            raise QuizError("Layout needs question and all four option/label/button regions.")
         for rect in [*data["regions"].values(), *data["buttons"].values()]:
             if len(rect) != 4 or any(type(v) is not int for v in rect):
                 raise QuizError("Regions must contain four integers: x,y,w,h.")
@@ -65,6 +65,8 @@ class Layout:
             raise QuizError("Screenshot aspect ratio differs from the calibrated layout; stop and recalibrate.")
         output = {}
         for name, (x, y, w, h) in self.data[group].items():
+            if group == "regions" and name == "title":
+                continue  # Older local layouts may retain the unused title region.
             left, top = round(x * width / self.width), round(y * height / self.height)
             right, bottom = round((x + w) * width / self.width), round((y + h) * height / self.height)
             output[name] = (left, top, max(1, right - left), max(1, bottom - top))
@@ -84,12 +86,29 @@ class Observation:
         return digest([self.question.view_token, self.size, self.buttons])
 
 
+def option_labels(fields, minimum):
+    # Count through the last visible option; gaps and partially read answers still fail validation.
+    labels = "AB"
+    for k in "CD":
+        text = any(b.text.strip() for b in fields.get(f"option_{k}", []))
+        label = any(b.text.strip() and (b.score >= minimum or re.search(r"\w", b.text))
+                    for b in fields.get(f"label_{k}", []))
+        if text or label:
+            labels = "ABCD"[:"ABCD".index(k) + 1]
+    return labels
+
+
 def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
                  captured_at: float, frame=None) -> Observation:
-    text = {name: join_blocks(fields.get(name, []), layout.minimum) for name in layout.data["regions"]}
-    if normalize(text["title"]) != "大理寺答题":
-        raise QuizError("Not the approved Dali knowledge-quiz screen.")
-    for label in "ABCD":
+    labels = option_labels(fields, layout.minimum)
+    names = ["question", *[f"label_{k}" for k in labels], *[f"option_{k}" for k in labels]]
+    text = {}
+    for name in names:
+        try:
+            text[name] = join_blocks(fields.get(name, []), layout.minimum)
+        except QuizError as exc:
+            raise QuizError(f"OCR 区域 {name} 未通过：{exc}") from exc
+    for label in labels:
         if normalize(text[f"label_{label}"]).upper() != label:
             raise QuizError(f"Option {label} label is missing/misaligned; inspect the layout.")
     stem = unicodedata.normalize("NFKC", text["question"])
@@ -98,9 +117,10 @@ def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
         raise QuizError("Question number or full question text was not recognized.")
     # Stable across process restarts: same account/day/instance/question number cannot be re-clicked.
     instance = digest([game_day(), scope, device_id, int(match[1]), int(match[2])])
-    options = tuple((k, re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in "ABCD")
+    options = tuple((k, re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
     question = Question(stem, options, instance, scope=scope)
-    return Observation(question, tuple(size), layout.scaled(*size, group="buttons"), captured_at, frame)
+    buttons = layout.scaled(*size, group="buttons")
+    return Observation(question, tuple(size), {k: buttons[k] for k in labels}, captured_at, frame)
 
 
 class QuizReader:
@@ -114,6 +134,15 @@ class QuizReader:
         rois = self.layout.scaled(width, height)
         fields = {name: self.session.ocr(frame, roi, single_line=name.startswith("label_"))
                   for name, roi in rois.items()}
+        labels = option_labels(fields, self.layout.minimum)
+        if len(labels) < 4:
+            # Two/three-choice questions have no icons; include text next to the letter.
+            for label in labels:
+                lx, _, lw, _ = rois[f"label_{label}"]
+                x, y, w, h = rois[f"option_{label}"]
+                left = lx + lw + round(5 * width / self.layout.width)
+                rois[f"option_{label}"] = (left, y, x + w - left, h)
+                fields[f"option_{label}"] = self.session.ocr(frame, rois[f"option_{label}"])
         return frame, captured_at, fields, rois
 
     def read(self):
@@ -159,9 +188,9 @@ def write_json(path: Path, data):
 
 
 def answer_once(reader, session, store: QuizStore, *, provider=None, execute=False,
-                layout_confirmed=False, allow_trial=False, max_daily_calls=30,
+                layout_confirmed=False, allow_trial=False, max_daily_calls=30, random_answer=False,
                 receipt_dir: Path = Path("data/receipts"), sleep=time.sleep,
-                should_stop=None):
+                should_stop=None, expected_view_token=None):
     def require_active():
         if should_stop is not None and should_stop():
             raise QuizError("Operation cancelled; no game click sent.")
@@ -174,8 +203,10 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     stable = reader.read()
     assert_same(first, stable)
     require_active()
+    if expected_view_token is not None and stable.question.view_token != expected_view_token:
+        raise QuizError("题目已切换，自动提交已暂停；未调用 AI 或点击游戏。")
     decision = store.resolve(stable.question, provider, allow_trial=allow_trial,
-                             max_daily_calls=max_daily_calls)
+                             max_daily_calls=max_daily_calls, random_answer=random_answer)
     require_active()  # Especially important after the potentially slow, paid API request.
     result = {"decision": decision.to_dict(), "click_sent": False, "outcome": "not_submitted"}
     if not execute or not decision.can_submit:

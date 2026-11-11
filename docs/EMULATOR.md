@@ -39,7 +39,8 @@ $PY = ".\.venv\Scripts\python.exe"
 不依赖 PowerShell 激活脚本，直接调用虚拟环境的 Python，避免执行策略问题。
 `setup_ocr.py` 从 MaaCommonAssets 的固定提交下载约 21.3 MB 的中文 PP-OCRv5 模型和说明，
 按精确长度和 Git blob SHA 校验。模型文件不提交进本仓库，不自动执行下载内容。
-GitHub 原始文件域名不可访问时安装会明确失败，不会改用不明镜像。
+GitHub 原始文件域名下载失败时，会自动改用 GitHub 官方 API 下载同一固定版本，每个文件最多尝试 3 次。
+两种官方地址均不可访问时会明确失败，不会改用不明镜像。
 
 公司网络需按网络管理要求配置访问；不要禁用 TLS 校验。
 已完整安装时 `--verify` 不联网。不需要安装 CUDA；本地 OCR 不产生 OpenAI API 费用。
@@ -103,8 +104,8 @@ $SERIAL = "127.0.0.1:你的实例端口"
 ```
 
 `capture` 仅截图，不需要 OCR 模型；产生 `data/capture.png` 和 `data/capture-overlay.png`。
-`guard` 运行资源包中真正的 Maa `DaliSceneGuard` 流水线，只识别标题，动作是 `DoNothing`。
-`inspect` 读取同一帧的标题、题号/题干、A/B/C/D 标签及四个选项；结果写在
+`guard` 校验题号、题干及实际选项，并运行 Maa `DaliSceneGuard` 流水线检查题号，动作是 `DoNothing`。
+`inspect` 读取同一帧的题号/题干和二至四个选项及字母标签，不读取会被公告遮挡的顶部标题；结果写在
 `data/maa/inspection/ocr.json`，同目录有截图和区域框图。不调用 OpenAI，也不点击。
 
 当前 ROI 是从已有 834×470 参考图人工标注的 **初始配置**，不是已经实测通过的模板。
@@ -167,7 +168,7 @@ JSON、README、命令历史或 Git。此设备 CLI 仅传题目文字，不上�
 | 找不到设备 | 确认模拟器已启动、开启本机 ADB、实例端口正确；使用同一份 adb.exe 检查 devices |
 | 多个设备 | 在 local.json 显式指定 address，不关闭/删除其他实例的数据 |
 | 模型缺失 | 运行 setup_ocr.py，再运行 --verify；保留失败信息，不用未知模型包替换 |
-| 标题/标签未匹配 | 手动进入大理寺题目，检查 overlay、黑边、横屏比例和字体识别结果 |
+| 题号/选项标签未匹配 | 手动进入大理寺题目，检查 overlay、黑边、横屏比例和字体识别结果 |
 | 低分/漏字 | 修正 ROI、提高画面清晰度，再核对 inspect；不要强行点击 |
 | API 失败/弃答 | 原核心会保留状态，避免自动重复收费；检查模型权限和题目，不循环重试 |
 | 重复提交被拒 | 查看回执并按实际反馈回写，不删除数据库来绕过保护 |

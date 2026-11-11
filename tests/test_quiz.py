@@ -23,6 +23,13 @@ class FakeProvider:
 
 
 class QuestionTests(unittest.TestCase):
+    def test_two_and_three_options_supported_but_gaps_rejected(self):
+        question = Question.from_dict({"stem": "第2/10题：测试？", "options": {"A": "甲", "B": "乙"}, "instance_id": "two"})
+        self.assertEqual(tuple(dict(question.options)), ("A", "B"))
+        three = Question.from_dict({"stem": "第3/10题：测试？", "options": {"A": "甲", "B": "乙", "C": "丙"}, "instance_id": "three"})
+        self.assertEqual(tuple(dict(three.options)), ("A", "B", "C"))
+        with self.assertRaises(QuizError):
+            Question("测试？", (("A", "甲"), ("B", "乙"), ("D", "丁")), "gap")
     def test_order_invariant(self):
         self.assertEqual(q().key, q(texts=("深圳", "北京", "上海", "广州")).key)
     def test_ordinal_ignored(self):
@@ -57,6 +64,25 @@ class StoreTests(unittest.TestCase):
     def tearDown(self): self.store.close()
     def test_cache_miss_without_ai(self):
         self.assertEqual(self.store.resolve(q()).status, "miss")
+    def test_random_does_not_change_existing_bank_or_use_provider(self):
+        original = self.store.resolve(q(), self.ai)
+        with patch("quiz_core.random.choice", return_value=q().options[0]):
+            decision = self.store.resolve(q(), self.ai, random_answer=True)
+        self.assertEqual(decision.origin, "random")
+        self.assertTrue(self.store.claim_submission(decision, q()))
+        self.store.feedback(decision.attempt_id, "wrong", "Random answer test")
+        bank = self.store.resolve(q())
+        self.assertEqual((bank.status, bank.answer_text), (original.status, original.answer_text))
+        self.assertEqual(self.ai.calls, 1)
+
+    def test_new_question_gets_new_random_choice(self):
+        with patch("quiz_core.random.choice", side_effect=[q().options[0], q().options[3]]) as choose:
+            first = self.store.resolve(q(), random_answer=True)
+            again = self.store.resolve(q(), random_answer=True)
+            next_view = self.store.resolve(q(instance="frame-2"), random_answer=True)
+        self.assertEqual(first.label, again.label)
+        self.assertEqual(next_view.label, "D")
+        self.assertEqual(choose.call_count, 2)
     def test_candidate_cached_no_second_call(self):
         a = self.store.resolve(q(), self.ai)
         b = self.store.resolve(q(), self.ai)
