@@ -72,6 +72,12 @@ class GuiLayoutTests(unittest.TestCase):
                 params = window.answer_params(execute=False)
                 self.assertTrue(params["random_answer"])
                 self.assertFalse(params["use_ai"])
+                automatic = window.answer_params(execute=True, automatic=True)
+                self.assertTrue(automatic["layout_confirmed"])
+                self.assertFalse(automatic["use_ai"])
+                self.assertTrue(window.answer_params(execute=True)["layout_confirmed"])
+                window.random_answer.setChecked(False)
+                window.ai_enabled.setChecked(False)
                 window.layout_confirmed.setChecked(True)
                 with self.assertRaisesRegex(gui_app.QuizError, "题目 OCR 尚未通过"):
                     window.answer_params(execute=True)
@@ -96,6 +102,8 @@ class GuiLayoutTests(unittest.TestCase):
                 self.assertTrue(automatic["allow_trial"])
                 window.random_answer.setChecked(True)
                 self.assertFalse(window.answer_params(execute=True, automatic=True)["use_ai"])
+                window.last_inspection_valid = False
+                window.layout_confirmed.setChecked(False)
                 with patch.object(gui_app.QMessageBox, "question", return_value=gui_app.QMessageBox.StandardButton.Yes), \
                         patch.object(window, "run_command") as run:
                     window.start_auto_answer()

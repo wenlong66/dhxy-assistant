@@ -279,6 +279,7 @@ class MainWindow(QMainWindow):
         self.random_answer.toggled.connect(self.ai_enabled.setDisabled)
         self.random_answer.toggled.connect(self.allow_trial.setDisabled)
         self.layout_confirmed = QCheckBox("已核对本设备 OCR、选项位置与区域框图")
+        self.layout_confirmed.setToolTip("仅非随机的单题手动提交需要确认；随机和自动答题会自行识别并校验按钮。")
         for ch in (self.random_answer, self.ai_enabled, self.allow_trial, self.layout_confirmed):
             options_l.addWidget(ch)
         self.model_edit = QLineEdit(os.environ.get("OPENAI_MODEL", ""))
@@ -474,18 +475,19 @@ class MainWindow(QMainWindow):
     def answer_params(self, *, execute: bool, automatic=False):
         if not self.dali_check.isChecked():
             raise QuizError("没有勾选已实现的大理寺答题模块。")
-        if execute and not self.last_inspection_valid:
+        random_answer = self.random_answer.isChecked()
+        if execute and not (automatic or random_answer) and not self.last_inspection_valid:
             raise QuizError("题目 OCR 尚未通过：请点击「OCR 识别当前题」，到「OCR 调试」查看题号、题干和选项的识别结果。")
-        if execute and not self.layout_confirmed.isChecked():
+        if execute and not (automatic or random_answer) and not self.layout_confirmed.isChecked():
             raise QuizError("题目 OCR 已通过，请核对题干、全部选项及区域框图，再勾选布局确认。")
-        use_ai = (automatic or self.ai_enabled.isChecked()) and not self.random_answer.isChecked()
+        use_ai = (automatic or self.ai_enabled.isChecked()) and not random_answer
         if use_ai and not self.model_edit.text().strip():
             raise QuizError("按题作答需要填写 OpenAI 模型 ID。")
         return {"use_ai": use_ai, "model": self.model_edit.text().strip(),
                 "api_key": self.key_edit.text(), "execute": execute,
-                "random_answer": self.random_answer.isChecked(),
+                "random_answer": random_answer,
                 "allow_trial": automatic or self.allow_trial.isChecked(),
-                "layout_confirmed": execute and self.layout_confirmed.isChecked(),
+                "layout_confirmed": execute and (automatic or random_answer or self.layout_confirmed.isChecked()),
                 "max_daily_calls": self.max_calls.value()}
 
     def preview_answer(self):
@@ -517,7 +519,7 @@ class MainWindow(QMainWindow):
                 "题库优先，未命中时调用 AI 并自动提交候选答案，可能产生 API 费用。")
         confirmation = QMessageBox.question(
             self, "开始自动答题", mode + "\n\n将从当前题连续答到本轮最后一题。"
-            "答案可能出错，不会自动标记答对。\n点击「断开 / 停止」可中止后续提交。",
+            "程序会自动识别题目并检查布局，答案可能出错，不会自动标记答对。\n点击「断开 / 停止」可中止后续提交。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if confirmation == QMessageBox.StandardButton.Yes:
@@ -594,7 +596,8 @@ class MainWindow(QMainWindow):
             self.log("设备工作线程已退出。")
             return
         if kind == "started":
-            self.log("开始操作：" + payload)
+            self.log("自动答题已启动：正在自动识别与校验，无需手动 OCR 或勾选确认。"
+                     if payload == "auto_answer" else "开始操作：" + payload)
             return
         if kind == "error":
             command, message = payload

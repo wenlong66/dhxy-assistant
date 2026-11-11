@@ -1,9 +1,12 @@
 from __future__ import annotations
 import json
+import sqlite3
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone
+from pathlib import Path
 from quiz_core import AIAnswer, OpenAIProvider, Question, QuizError, QuizStore, game_day
 
 
@@ -64,6 +67,32 @@ class StoreTests(unittest.TestCase):
     def tearDown(self): self.store.close()
     def test_cache_miss_without_ai(self):
         self.assertEqual(self.store.resolve(q()).status, "miss")
+    def test_switching_mode_cannot_resubmit_same_question_instance(self):
+        normal = q()
+        first = self.store.resolve(normal, self.ai, allow_trial=True)
+        self.assertTrue(self.store.claim_submission(first, normal))
+        simplified = Question("第1/10题:随机答题", (("A", "选项A"), ("B", "选项B")), normal.instance_id, normal.scope)
+        second = self.store.resolve(simplified, random_answer=True)
+        self.assertFalse(self.store.claim_submission(second, simplified))
+
+    def test_legacy_attempts_migrate_without_losing_records(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.sqlite3"
+            legacy = sqlite3.connect(path)
+            legacy.execute("""CREATE TABLE attempts(
+                id TEXT PRIMARY KEY, qkey TEXT, answer_text TEXT, label TEXT,
+                view_token TEXT, eligible INTEGER, origin TEXT, created_at TEXT,
+                submitted_at TEXT, outcome TEXT DEFAULT 'pending',
+                evidence TEXT DEFAULT '', feedback_source TEXT DEFAULT '')""")
+            legacy.execute("INSERT INTO attempts(id,qkey,submitted_at) VALUES('old','old-key','2026-11-11')")
+            legacy.commit()
+            legacy.close()
+            store = QuizStore(path)
+            try:
+                row = store.db.execute("SELECT id,submitted_at,instance_token FROM attempts").fetchone()
+                self.assertEqual(tuple(row), ("old", "2026-11-11", ""))
+            finally:
+                store.close()
     def test_random_does_not_change_existing_bank_or_use_provider(self):
         original = self.store.resolve(q(), self.ai)
         with patch("quiz_core.random.choice", return_value=q().options[0]):

@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import random
 import tempfile
 import time
 import unittest
@@ -42,6 +43,13 @@ class LayoutTests(unittest.TestCase):
     def test_normal_720p(self):
         self.assertEqual(set(self.layout.scaled(1280, 720)), set(fields()))
 
+    def test_four_option_regions_include_text_without_icons_and_third_line(self):
+        regions = self.layout.scaled(1600, 900)
+        for name, px, py in (("option_A", 600, 520), ("option_C", 600, 718), ("option_D", 958, 685)):
+            with self.subTest(region=name):
+                x, y, w, h = regions[name]
+                self.assertTrue(x <= px < x + w and y <= py < y + h)
+
     def test_parse_two_options_without_lower_buttons(self):
         data = fields()
         for label in "CD":
@@ -75,6 +83,25 @@ class LayoutTests(unittest.TestCase):
             return fields()[name]
         session = NS(capture=lambda: NS(shape=(470, 834, 3)), ocr=ocr, address="test-device")
         self.assertEqual(len(QuizReader(session, self.layout, "test-profile").read().question.options), 4)
+
+    def test_random_reader_only_reads_number_and_existing_button_letters(self):
+        rois = self.layout.scaled(834, 470)
+        for count in (2, 3, 4):
+            with self.subTest(count=count):
+                calls = []
+                def ocr(frame, roi, *, single_line=False):
+                    calls.append(roi)
+                    if roi[0:2] == rois["question"][0:2]:
+                        return [TextBlock("第5/10题：", .99, (0, 0, 90, 20)),
+                                TextBlock("读不清的题干", .1, (0, 30, 90, 20))]
+                    label = next(k for k in "ABCD" if roi == rois[f"label_{k}"])
+                    return [TextBlock(label if label in "ABCD"[:count] else "-", .99 if label in "ABCD"[:count] else .3, (0, 0, 20, 20))]
+                session = NS(capture=lambda: NS(shape=(470, 834, 3)), ocr=ocr, address="test-device")
+                result = QuizReader(session, self.layout, "test-profile", random_answer=True).read()
+                self.assertEqual(dict(result.question.options), {k: f"选项{k}" for k in "ABCD"[:count]})
+                self.assertEqual(set(result.buttons), set("ABCD"[:count]))
+                self.assertEqual(len(calls), 5)
+                self.assertTrue(all(roi not in [rois[f"option_{k}"] for k in "ABCD"] for roi in calls))
 
     def test_reject_portrait(self):
         with self.assertRaises(QuizError): self.layout.scaled(720, 1280)
@@ -184,6 +211,12 @@ class ExecutionTests(unittest.TestCase):
     def run_answer(self, **extra):
         return answer_once(self.reader, self.session, self.store, **dict(self.kw, **extra))
 
+    def assert_click_inside_button(self, label):
+        self.session.click.assert_called_once()
+        px, py = self.session.click.call_args.args
+        x, y, w, h = observation().buttons[label]
+        self.assertTrue(x < px < x + w - 1 and y < py < y + h - 1)
+
     def test_default_never_clicks(self):
         result = self.run_answer(allow_trial=True)
         self.assertFalse(result["click_sent"])
@@ -202,7 +235,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(choose.call_count, 1)
         self.assertEqual(preview["decision"]["answer_text"], submitted["decision"]["answer_text"])
         self.assertEqual(submitted["decision"]["origin"], "random")
-        self.session.click.assert_called_once_with(363, 279)
+        self.assert_click_inside_button("A")
         self.assertEqual(self.provider.calls, 0)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 0)
@@ -218,10 +251,31 @@ class ExecutionTests(unittest.TestCase):
             self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
         self.assertEqual(self.session.click.call_count, 1)
 
+    def test_click_points_vary_and_stay_inside_button(self):
+        points = set()
+        rng = random.Random(23)
+        with patch("quiz_core.random.choice", return_value=("A", "甲")), patch(
+            "quiz_vision.random.randint", side_effect=rng.randint
+        ):
+            for _ in range(20):
+                store = QuizStore(":memory:")
+                self.session.click.reset_mock()
+                try:
+                    result = answer_once(self.reader, self.session, store, random_answer=True,
+                                         execute=True, layout_confirmed=True, **self.kw)
+                finally:
+                    store.close()
+                point = tuple(result["target"])
+                self.assertTrue(277 < point[0] < 449 and 250 < point[1] < 308)
+                self.session.click.assert_called_once_with(*point)
+                points.add(point)
+        self.assertGreater(len(points), 1)
+
     def test_two_and_three_option_random_submission_only_clicks_existing_buttons(self):
-        for count, point in ((2, (548, 279)), (3, (363, 346))):
+        for count in (2, 3):
             with self.subTest(count=count):
                 data = fields()
+                data["question"] = [TextBlock(f"第{count}/10题：测试选项数量？", .99, (0, 0, 90, 20))]
                 for label in "ABCD"[count:]:
                     data[f"label_{label}"] = []
                     data[f"option_{label}"] = []
@@ -231,7 +285,7 @@ class ExecutionTests(unittest.TestCase):
                 with patch("quiz_core.random.choice", return_value=(label, "甲乙丙丁"[count - 1])):
                     result = self.run_answer(random_answer=True, execute=True, layout_confirmed=True)
                 self.assertEqual(result["decision"]["label"], label)
-                self.session.click.assert_called_once_with(*point)
+                self.assert_click_inside_button(label)
                 self.assertEqual(self.provider.calls, 0)
 
     def test_execute_requires_calibration_ack(self):
@@ -253,7 +307,7 @@ class ExecutionTests(unittest.TestCase):
     def test_one_click_never_auto_verifies(self):
         result = self.run_answer(execute=True, layout_confirmed=True, allow_trial=True)
         self.assertTrue(result["click_sent"])
-        self.session.click.assert_called_once_with(363, 279)
+        self.assert_click_inside_button("A")
         self.assertEqual(result["outcome"], "awaiting_manual_feedback")
         self.assertEqual(self.store.db.execute("SELECT status FROM answers").fetchone()[0], "candidate")
         self.assertEqual(self.reader.read.call_count, 4)

@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from maa_adapter import ROOT, MaaSession, load_config, save_image
 from quiz_core import OpenAIProvider, QuizError, QuizStore
-from quiz_vision import DeviceLock, Layout, QuizReader, answer_once, parse_fields, write_json
+from quiz_vision import DeviceLock, Layout, QuizReader, ReadError, answer_once, parse_fields, write_json
 
 LOCAL_CONFIG = ROOT / "config/local.json"
 USER_SETTINGS = ("adb_path", "address", "account_scope", "layout")
@@ -215,7 +215,7 @@ class DeviceBackend:
         store = QuizStore(cfg["database"])
         try:
             provider = OpenAIProvider(model=model, api_key=api_key or None) if use_ai else None
-            reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
+            reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"], random_answer=random_answer)
             return answer_once(reader, session, store, provider=provider, execute=execute,
                                layout_confirmed=layout_confirmed, allow_trial=allow_trial,
                                max_daily_calls=max_daily_calls, random_answer=random_answer,
@@ -227,12 +227,12 @@ class DeviceBackend:
 
     def auto_answer(self, *, should_stop: Callable[[], bool], on_result=None, **options) -> dict:
         session, cfg = self._need_session()
-        if not options.get("layout_confirmed"):
-            raise QuizError("请先识别题目并核对布局，再启动自动答题。")
-        options.update(execute=True, use_ai=not options.get("random_answer", False), allow_trial=True)
+        # The automatic reader validates the scene and layout before authorizing a click.
+        options.update(execute=True, layout_confirmed=True,
+                       use_ai=not options.get("random_answer", False), allow_trial=True)
         if options["use_ai"] and not options.get("model", "").strip():
             raise QuizError("自动按题作答需要填写 AI 模型 ID 和 API Key；题库未命中时会调用 AI。")
-        reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
+        reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"], random_answer=options.get("random_answer", False))
         submitted = last_number = 0
         last_total = last_view = None
         deadline = time.monotonic() + cfg["timeout_seconds"]
@@ -257,6 +257,10 @@ class DeviceBackend:
                     continue
             try:
                 result = self.answer(should_stop=should_stop, expected_view_token=observation.question.view_token, **options)
+            except ReadError as exc:
+                last_error = str(exc)
+                time.sleep(0.5)
+                continue
             except QuizError:
                 if should_stop():
                     break

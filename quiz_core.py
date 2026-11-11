@@ -268,7 +268,7 @@ class QuizStore:
             label TEXT NOT NULL, view_token TEXT NOT NULL, eligible INTEGER NOT NULL,
             origin TEXT NOT NULL, created_at TEXT NOT NULL, submitted_at TEXT,
             outcome TEXT NOT NULL DEFAULT 'pending', evidence TEXT NOT NULL DEFAULT '',
-            feedback_source TEXT NOT NULL DEFAULT ''
+            feedback_source TEXT NOT NULL DEFAULT '', instance_token TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS requests(
             id TEXT PRIMARY KEY, qkey TEXT NOT NULL, game_day TEXT NOT NULL,
@@ -278,6 +278,9 @@ class QuizStore:
         CREATE INDEX IF NOT EXISTS attempts_key ON attempts(qkey);
         CREATE INDEX IF NOT EXISTS requests_day ON requests(game_day);
         """)
+        with self.transaction() as db:
+            if "instance_token" not in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}:
+                db.execute("ALTER TABLE attempts ADD COLUMN instance_token TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def transaction(self):
@@ -301,8 +304,8 @@ class QuizStore:
         attempt_id = None
         if label and row["status"] in {"candidate", "verified"}:
             attempt_id = uuid.uuid4().hex
-            db.execute("INSERT INTO attempts(id,qkey,answer_text,label,view_token,eligible,origin,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now()))
+            db.execute("INSERT INTO attempts(id,qkey,answer_text,label,view_token,eligible,origin,created_at,instance_token) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now(), digest([q.scope, q.instance_id])))
         return Decision(q.key, q.view_token, answer, label, row["status"], origin,
                         row["reason"], attempt_id, eligible)
 
@@ -383,6 +386,9 @@ class QuizStore:
                 return False
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"])).total_seconds()
             if age < 0 or age > max_age_seconds or current.label_for(row["answer_text"]) != row["label"]:
+                return False
+            if db.execute("SELECT 1 FROM attempts WHERE instance_token=? AND submitted_at IS NOT NULL LIMIT 1",
+                          (digest([current.scope, current.instance_id]),)).fetchone():
                 return False
             bank = db.execute("SELECT status,answer_text FROM answers WHERE qkey=?", (current.key,)).fetchone()
             if row["origin"] != "random" and (not bank or bank["answer_text"] != row["answer_text"]

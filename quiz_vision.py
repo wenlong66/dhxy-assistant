@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import time
 import unicodedata
@@ -11,6 +12,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from quiz_core import Question, QuizError, QuizStore, digest, game_day, normalize
+
+
+class ReadError(QuizError):
+    """An unreadable or changing frame that can be retried before any click."""
 
 
 @dataclass(frozen=True)
@@ -99,9 +104,11 @@ def option_labels(fields, minimum):
 
 
 def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
-                 captured_at: float, frame=None) -> Observation:
+                 captured_at: float, frame=None, *, random_answer=False) -> Observation:
     labels = option_labels(fields, layout.minimum)
-    names = ["question", *[f"label_{k}" for k in labels], *[f"option_{k}" for k in labels]]
+    names = [f"label_{k}" for k in labels]
+    if not random_answer:
+        names = ["question", *names, *[f"option_{k}" for k in labels]]
     text = {}
     for name in names:
         try:
@@ -111,50 +118,61 @@ def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
     for label in labels:
         if normalize(text[f"label_{label}"]).upper() != label:
             raise QuizError(f"Option {label} label is missing/misaligned; inspect the layout.")
-    stem = unicodedata.normalize("NFKC", text["question"])
-    match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题\s*:\s*(.+)$", stem, re.S)
+    if random_answer:
+        matches = []
+        for block in fields.get("question", []):
+            found = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题", unicodedata.normalize("NFKC", block.text).strip())
+            if found:
+                join_blocks([block], layout.minimum)
+                matches.append(found)
+        if len(matches) != 1:
+            raise QuizError("无法确认当前题号，暂不随机点击。")
+        match = matches[0]
+        stem = f"第{int(match[1])}/{int(match[2])}题:随机答题 {game_day()} {int(match[1])}/{int(match[2])}"
+    else:
+        stem = unicodedata.normalize("NFKC", text["question"])
+        match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题\s*:\s*(.+)$", stem, re.S)
     if not match or not 1 <= int(match[1]) <= int(match[2]) <= 100:
         raise QuizError("Question number or full question text was not recognized.")
     # Stable across process restarts: same account/day/instance/question number cannot be re-clicked.
     instance = digest([game_day(), scope, device_id, int(match[1]), int(match[2])])
-    options = tuple((k, re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
+    options = tuple((k, f"选项{k}" if random_answer else re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
     question = Question(stem, options, instance, scope=scope)
     buttons = layout.scaled(*size, group="buttons")
     return Observation(question, tuple(size), {k: buttons[k] for k in labels}, captured_at, frame)
 
 
 class QuizReader:
-    def __init__(self, session, layout: Layout, scope: str):
+    def __init__(self, session, layout: Layout, scope: str, *, random_answer=False):
         self.session, self.layout, self.scope = session, layout, scope
+        self.random_answer = random_answer
 
     def inspect(self):
         frame = self.session.capture()
         captured_at = time.monotonic()
         height, width = frame.shape[:2]
         rois = self.layout.scaled(width, height)
+        if self.random_answer:
+            rois = {name: roi for name, roi in rois.items() if name == "question" or name.startswith("label_")}
+            x, y, w, h = rois["question"]
+            rois["question"] = (x, y, min(w, round(90 * width / self.layout.width)), h)
         fields = {name: self.session.ocr(frame, roi, single_line=name.startswith("label_"))
                   for name, roi in rois.items()}
-        labels = option_labels(fields, self.layout.minimum)
-        if len(labels) < 4:
-            # Two/three-choice questions have no icons; include text next to the letter.
-            for label in labels:
-                lx, _, lw, _ = rois[f"label_{label}"]
-                x, y, w, h = rois[f"option_{label}"]
-                left = lx + lw + round(5 * width / self.layout.width)
-                rois[f"option_{label}"] = (left, y, x + w - left, h)
-                fields[f"option_{label}"] = self.session.ocr(frame, rois[f"option_{label}"])
         return frame, captured_at, fields, rois
 
     def read(self):
-        frame, captured, fields, rois = self.inspect()
-        return parse_fields(fields, self.layout, (frame.shape[1], frame.shape[0]),
-                            self.session.address, self.scope, captured, frame)
+        try:
+            frame, captured, fields, rois = self.inspect()
+            return parse_fields(fields, self.layout, (frame.shape[1], frame.shape[0]),
+                                self.session.address, self.scope, captured, frame, random_answer=self.random_answer)
+        except QuizError as exc:
+            raise ReadError(str(exc)) from exc
 
 
 def assert_same(first: Observation, current: Observation, max_age: float = 20):
     age = time.monotonic() - current.captured_at
     if current.signature != first.signature or age < 0 or age > max_age:
-        raise QuizError("Question/layout changed or screenshot is stale; no click performed.")
+        raise ReadError("Question/layout changed or screenshot is stale; no click performed.")
 
 
 class DeviceLock:
@@ -204,7 +222,7 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     assert_same(first, stable)
     require_active()
     if expected_view_token is not None and stable.question.view_token != expected_view_token:
-        raise QuizError("题目已切换，自动提交已暂停；未调用 AI 或点击游戏。")
+        raise ReadError("题目已切换，当前提交取消；未调用 AI 或点击游戏。")
     decision = store.resolve(stable.question, provider, allow_trial=allow_trial,
                              max_daily_calls=max_daily_calls, random_answer=random_answer)
     require_active()  # Especially important after the potentially slow, paid API request.
@@ -222,9 +240,12 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     if label is None or label != decision.label:
         raise QuizError("Answer is not uniquely mapped to the current option.")
     x, y, w, h = final.buttons[label]
-    point = (x + w // 2, y + h // 2)
-    if not (0 <= point[0] < final.size[0] and 0 <= point[1] < final.size[1]):
-        raise QuizError("Target outside screenshot.")
+    if min(w, h) <= 0 or min(x, y) < 0 or x + w > final.size[0] or y + h > final.size[1]:
+        raise QuizError("Answer button is outside screenshot.")
+    inset_x = min(max(1, w // 10), (w - 1) // 2)
+    inset_y = min(max(1, h // 10), (h - 1) // 2)
+    point = (random.randint(x + inset_x, x + w - 1 - inset_x),
+             random.randint(y + inset_y, y + h - 1 - inset_y))
     receipt = receipt_dir / f"{decision.attempt_id}.json"
     result.update(target=list(point), outcome="prepared", question_key=final.question.key)
     # Persist intent before claiming or touching the game; disk errors must prevent a click.

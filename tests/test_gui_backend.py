@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import gui_backend
 from gui_backend import DeviceBackend, query_bank, save_local_settings
 from quiz_core import AIAnswer, Decision, OpenAIProvider, Question, QuizError, QuizStore
-from quiz_vision import Layout, Observation, answer_once
+from quiz_vision import Layout, Observation, ReadError, answer_once
 
 
 class SettingsAndBankTests(unittest.TestCase):
@@ -177,7 +177,7 @@ class BackendSessionTests(unittest.TestCase):
                     *args, sleep=lambda _: None, **kw
                 )):
                     reader.return_value.read.side_effect = lambda: self.auto_frame(self.backend.session.click_count + 1, 10)
-                    result = self.backend.auto_answer(random_answer=random_answer, model="test-model", layout_confirmed=True,
+                    result = self.backend.auto_answer(random_answer=random_answer, model="test-model", layout_confirmed=False,
                                                      should_stop=lambda: False, on_result=progress.append)
                 self.assertEqual(result, {"submitted": 10, "reason": "completed"})
                 self.assertEqual(self.backend.session.click_count, 10)
@@ -199,6 +199,30 @@ class BackendSessionTests(unittest.TestCase):
             self.assertEqual(self.backend.auto_answer(random_answer=True, layout_confirmed=True,
                                                      should_stop=lambda: False)["submitted"], 1)
             answer.assert_called_once()
+
+    def test_auto_retries_post_ai_ocr_failure_without_rebilling_or_double_click(self):
+        self.backend.connect()
+        frame = self.auto_frame(1, 1)
+        reads = 0
+        def read():
+            nonlocal reads
+            reads += 1
+            if reads == 4:
+                raise ReadError("temporary unreadable frame after AI returned")
+            return frame
+        provider = MagicMock()
+        provider.answer.return_value = AIAnswer("answer", "甲", "Offline fixture", "test-model")
+        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+            gui_backend, "OpenAIProvider", return_value=provider
+        ), patch.object(gui_backend, "answer_once", side_effect=lambda *args, **kw: answer_once(
+            *args, sleep=lambda _: None, **kw
+        )), patch("gui_backend.time.sleep"):
+            reader.return_value.read.side_effect = read
+            result = self.backend.auto_answer(random_answer=False, model="test-model", should_stop=lambda: False)
+        self.assertEqual(result["submitted"], 1)
+        self.assertEqual(provider.answer.call_count, 1)
+        self.assertEqual(self.backend.session.click_count, 1)
+        self.assertFalse(self.backend.session.execute)
 
     def test_auto_waits_for_new_question_and_finishes_last(self):
         self.backend.connect()
