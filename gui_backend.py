@@ -19,6 +19,7 @@ from typing import Any, Callable
 from maa_adapter import ROOT, MaaSession, load_config, save_image
 from quiz_core import OpenAIProvider, QuizError, QuizStore
 from quiz_vision import DeviceLock, Layout, QuizReader, ReadError, answer_once, parse_fields, write_json
+from daily_tasks import DailyRunner
 
 LOCAL_CONFIG = ROOT / "config/local.json"
 USER_SETTINGS = ("adb_path", "address", "account_scope", "layout")
@@ -278,6 +279,28 @@ class DeviceBackend:
             last_error = ""
             deadline = time.monotonic() + cfg["timeout_seconds"]
         return {"submitted": submitted, "reason": "stopped"}
+
+    def inspect_daily(self) -> dict:
+        session, cfg = self._need_session()
+        runner = DailyRunner(session, cfg["runtime_dir"], lambda: False)
+        view = runner.read()
+        result = {"valid": False, "png": preview_png(view.frame), "diagnostics": str(runner.folder)}
+        try:
+            cards = view.cards()
+            result.update(valid=True, cards=[asdict(c) for c in cards],
+                          sweep_available=any(c.action == "立即完成" and not c.done for c in cards))
+        except QuizError as exc:
+            result["error"] = str(exc)
+        runner.save(result.get("error", ""))
+        return result
+
+    def auto_daily(self, *, selected, should_stop, on_result=None) -> dict:
+        session, cfg = self._need_session()
+        session.execute = True
+        try:
+            return DailyRunner(session, cfg["runtime_dir"], should_stop, on_result).run(selected)
+        finally:
+            session.execute = False
 
     def bank(self, keyword="") -> list[dict]:
         cfg = self._config()

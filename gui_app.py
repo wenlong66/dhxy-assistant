@@ -144,6 +144,14 @@ class DeviceWorker:
                         result = backend.auto_answer(
                             should_stop=self.cancelled.is_set,
                             on_result=auto_progress, **args)
+                    elif command == "inspect_daily":
+                        result = backend.inspect_daily()
+                    elif command == "auto_daily":
+                        def daily_progress(progress):
+                            self.bridge.message.emit("daily_progress", progress)
+                            self.bridge.message.emit("preview", backend.capture())
+                        result = backend.auto_daily(should_stop=self.cancelled.is_set,
+                                                    on_result=daily_progress, **args)
                     elif command == "bank":
                         result = backend.bank(args.get("keyword", ""))
                     elif command == "feedback":
@@ -262,13 +270,24 @@ class MainWindow(QMainWindow):
         self.dali_check = QCheckBox("大理寺答题（单题／自动；已接入）")
         self.dali_check.setChecked(True)
         task_l.addWidget(self.dali_check)
-        for item in ("师门任务（尚未接入）", "帮派任务（尚未接入）", "宝图任务（尚未接入）", "五环任务（尚未接入）"):
-            check = QCheckBox(item)
-            check.setEnabled(False)
+        self.daily_checks = {}
+        for name, label in (("师门任务", "师门任务"), ("帮派任务", "帮派任务"),
+                            ("宝图任务", "宝图任务（仅金扫帚）"), ("五环任务", "五环任务"),
+                            ("卓越竞技场", "卓越竞技场（仅金扫帚）")):
+            check = QCheckBox(label)
+            check.setChecked(True)
+            self.daily_checks[name] = check
             task_l.addWidget(check)
-        task_note = QLabel("目前不支持一键完成全部日常，无法自动进入题目场景。")
+        task_note = QLabel("日常按当前列表顺序；自动用已有金扫帚，优先竞技场、宝图。大理寺单独启动。")
         task_note.setWordWrap(True)
         task_l.addWidget(task_note)
+        daily_controls = QHBoxLayout()
+        self.daily_inspect_btn = make_button("检查日常列表", lambda: self.run_command("inspect_daily"))
+        self.daily_start_btn = make_button("开始日常任务", self.start_daily)
+        self.daily_start_btn.setToolTip("从游戏主界面自动打开活动→扫帚列表，再领取、等待和核对次数；会消耗已有金扫帚，不调用 AI。")
+        daily_controls.addWidget(self.daily_inspect_btn)
+        daily_controls.addWidget(self.daily_start_btn)
+        task_l.addLayout(daily_controls)
         settings_row.addWidget(tasks, 1)
 
         options = QGroupBox("答题控制")
@@ -528,6 +547,13 @@ class MainWindow(QMainWindow):
     def refresh_bank(self):
         self.run_command("bank", keyword=self.bank_search.text())
 
+    def start_daily(self):
+        selected = [name for name, check in self.daily_checks.items() if check.isChecked()]
+        if not selected:
+            self.log("请先勾选要执行的日常任务。")
+            return
+        self.run_command("auto_daily", selected=selected)
+
     def save_feedback(self):
         result = self.outcome_combo.currentData()
         attempt = self.attempt_edit.text().strip()
@@ -553,8 +579,11 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(not busy and not self.connected)
         self.connect_btn.setEnabled(not busy and not self.connected)
         self.disconnect_btn.setEnabled(self.connected or busy)
-        for btn in (self.preview_btn, self.execute_btn, self.auto_btn, self.inspect_btn, self.guard_btn, self.screenshot_btn):
+        for btn in (self.preview_btn, self.execute_btn, self.auto_btn, self.inspect_btn, self.guard_btn,
+                    self.screenshot_btn, self.daily_inspect_btn, self.daily_start_btn):
             btn.setEnabled(self.connected and not busy)
+        for check in self.daily_checks.values():
+            check.setEnabled(not busy)
         self.pause_btn.setEnabled(self.connected)
         self.save_settings_btn.setEnabled(not busy and not self.connected)
         self.random_answer.setEnabled(not busy)
@@ -567,6 +596,9 @@ class MainWindow(QMainWindow):
         self.status.setText("执行中…" if busy else ("已连接" if self.connected else "未连接"))
 
     def on_event(self, kind: str, payload):
+        if kind == "daily_progress":
+            self.log(payload["message"])
+            return
         if kind == "auto_progress":
             self.answer_out.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
             attempt = (payload.get("decision") or {}).get("attempt_id")
@@ -647,6 +679,16 @@ class MainWindow(QMainWindow):
         elif command == "auto_answer":
             state = "本轮最后一题已提交" if result["reason"] == "completed" else "已停止"
             self.log(f"自动答题{state}；本次共提交 {result['submitted']} 题，未自动判定对错。")
+        elif command == "inspect_daily":
+            self.show_frame(result["png"])
+            self.answer_out.setPlainText(json.dumps({k: v for k, v in result.items() if k != "png"}, ensure_ascii=False, indent=2))
+            self.log("日常列表识别通过；请核对任务次数与按钮。" if result["valid"] else "日常识别暂停：" + result["error"])
+            self.log("日常诊断目录：" + result["diagnostics"])
+        elif command == "auto_daily":
+            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+            states = {"completed": "所选日常均已核对完成", "stopped": "已停止后续操作",
+                      "needs_attention": "竞技场缺少可用金扫帚，仍有未完成项"}
+            self.log(states[result["reason"]])
         elif command == "bank":
             self.bank_table.setRowCount(len(result))
             for i, row in enumerate(result):
