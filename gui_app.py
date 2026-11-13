@@ -26,7 +26,7 @@ except ImportError:
     print("GUI dependency missing. Run: python -m pip install -r requirements-gui.txt", file=sys.stderr)
     raise SystemExit(2)
 
-from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, local_settings, save_local_settings
+from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, local_settings, preview_png, save_local_settings
 from quiz_core import QuizError
 
 
@@ -148,8 +148,11 @@ class DeviceWorker:
                         result = backend.inspect_daily()
                     elif command == "auto_daily":
                         def daily_progress(progress):
-                            self.bridge.message.emit("daily_progress", progress)
-                            self.bridge.message.emit("preview", backend.capture())
+                            # Reuse the runner's fresh frame rather than acquiring another.
+                            frame = progress.get("frame")
+                            self.bridge.message.emit("daily_progress", {k: v for k, v in progress.items() if k != "frame"})
+                            if frame is not None and self.preview_enabled:
+                                self.bridge.message.emit("preview", {"png": preview_png(frame)})
                         result = backend.auto_daily(should_stop=self.cancelled.is_set,
                                                     on_result=daily_progress, **args)
                     elif command == "bank":

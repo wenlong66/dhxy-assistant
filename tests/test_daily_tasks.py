@@ -250,7 +250,7 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(clicks, [(29, 129), (29, 129), (733, 420)])
 
     def test_broom_entry_is_retried_and_stops_after_three_attempts(self):
-        with patch.object(self.runner, "read", return_value=view("weekly_activity")), \
+        with patch.object(self.runner, "read", side_effect=lambda: view("weekly_activity")), \
                 patch.object(self.session, "click") as click:
             with self.assertRaisesRegex(QuizError, "重试 3 次"):
                 self.runner.open_list()
