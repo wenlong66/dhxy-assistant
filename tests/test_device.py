@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import random
+import subprocess
 import tempfile
 import time
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
-from maa_adapter import ROOT, MaaSession, load_config, load_maa, select_device, wait_job
+from maa_adapter import ROOT, MaaSession, ldplayer_config, load_config, load_maa, select_device, wait_job
 from quiz_core import AIAnswer, QuizError, QuizStore
 from quiz_vision import (DeviceLock, Layout, QuizReader, TextBlock, answer_once, assert_same,
                          join_blocks, parse_fields)
@@ -379,6 +380,57 @@ class MaaVersionTests(unittest.TestCase):
                     load_maa()
 
 
+class LDPlayerConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+        self.adb = self.folder / "adb.exe"
+        for name in ("ldconsole.exe", "ldopengl64.dll"):
+            (self.folder / name).touch()
+        self.rows = "0,模拟器,10,20,1,101,201,1600,900,240"
+
+    def test_matches_serial_and_uses_current_pid_without_console_window(self):
+        rows = self.rows + "\n2,第二个,11,21,1,102,202,1600,900,240"
+        with patch("maa_adapter.subprocess.run", side_effect=[
+            NS(stdout=rows), NS(stdout="other\n"), NS(stdout="emulator-5558\r\n"),
+        ]) as run:
+            config = ldplayer_config(self.adb, "emulator-5558")
+        self.assertEqual(config, {"enable": True, "path": str(self.folder), "index": 2, "pid": 102})
+        self.assertEqual(run.call_args.args[0][1:], ["adb", "--index", "2", "--command", "get-serialno"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        self.assertEqual(run.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def test_missing_library_skips_console(self):
+        (self.folder / "ldopengl64.dll").unlink()
+        with patch("maa_adapter.subprocess.run") as run:
+            self.assertEqual(ldplayer_config(self.adb, "emulator-5554"), {})
+        run.assert_not_called()
+
+    def test_different_serial_never_enables_extras(self):
+        with patch("maa_adapter.subprocess.run", side_effect=[NS(stdout=self.rows), NS(stdout="emulator-5554")]):
+            self.assertEqual(ldplayer_config(self.adb, "127.0.0.1:5555"), {})
+
+    def test_duplicate_serial_is_ambiguous(self):
+        with patch("maa_adapter.subprocess.run", side_effect=[
+            NS(stdout=self.rows + "\n" + self.rows), NS(stdout="emulator-5554"), NS(stdout="emulator-5554"),
+        ]):
+            self.assertEqual(ldplayer_config(self.adb, "emulator-5554"), {})
+
+    def test_stopped_or_malformed_instances_are_not_selected(self):
+        for rows in ("broken", self.rows.replace(",1,101,", ",0,101,"), self.rows.replace(",101,", ",-1,"),
+                     self.rows.replace("0,模拟器", "invalid,模拟器")):
+            with self.subTest(rows=rows), patch("maa_adapter.subprocess.run", return_value=NS(stdout=rows)) as run:
+                self.assertEqual(ldplayer_config(self.adb, "emulator-5554"), {})
+                self.assertEqual(run.call_count, 1)
+
+    def test_console_failures_preserve_adb_fallback(self):
+        for error in (OSError("unavailable"), subprocess.TimeoutExpired("ldconsole", 5),
+                      subprocess.CalledProcessError(1, "ldconsole")):
+            with self.subTest(error=error), patch("maa_adapter.subprocess.run", side_effect=error):
+                self.assertEqual(ldplayer_config(self.adb, "emulator-5554"), {})
+
+
 class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -390,7 +442,7 @@ class AdapterTests(unittest.TestCase):
         self.ctrl.post_connection.return_value = self.job
         self.ctrl.post_click.return_value = self.job
         self.api = {"Toolkit": MagicMock(), "AdbController": MagicMock(return_value=self.ctrl),
-                    "Screen": NS(Encode=2), "Input": NS(AdbShell=1),
+                    "Screen": NS(Encode=2, EmulatorExtras=64), "Input": NS(AdbShell=1),
                     "Resource": MagicMock(), "Tasker": MagicMock(), "JOCR": lambda **kw: NS(**kw)}
         self.device = NS(name="mock", adb_path="adb.exe", address="127.0.0.1:12345",
                          screencap_methods=2, input_methods=1, config={})
@@ -403,6 +455,27 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(session.address, self.device.address)
         self.ctrl.set_screenshot_use_raw_size.assert_called_once_with(True)
         self.ctrl.post_click.assert_not_called()
+
+    def test_ld_extras_keeps_adb_methods_and_existing_device_config(self):
+        self.device.config = {"other": True, "extras": {"mumu": {"enable": True}}}
+        original = copy.deepcopy(self.device.config)
+        ld = {"enable": True, "path": "C:/LD", "index": 2, "pid": 123}
+        with patch("maa_adapter.ldplayer_config", return_value=ld) as detect:
+            MaaSession(self.cfg, api=self.api).connect()
+        detect.assert_called_once_with(self.device.adb_path, self.device.address)
+        params = self.api["AdbController"].call_args.kwargs
+        self.assertEqual(params["screencap_methods"], 2 | 64)
+        self.assertEqual(params["input_methods"], self.device.input_methods)
+        self.assertEqual(params["config"], {**original, "extras": {**original["extras"], "ld": ld}})
+        self.assertEqual(self.device.config, original)
+        self.ctrl.post_click.assert_not_called()
+
+    def test_unmatched_ld_instance_preserves_original_connection(self):
+        with patch("maa_adapter.ldplayer_config", return_value={}):
+            MaaSession(self.cfg, api=self.api).connect()
+        params = self.api["AdbController"].call_args.kwargs
+        self.assertEqual(params["screencap_methods"], self.device.screencap_methods)
+        self.assertEqual(params["config"], self.device.config)
 
     def test_multiple_devices_rejected(self):
         with self.assertRaises(QuizError): select_device([self.device, NS(address="other")])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,36 @@ def select_device(devices, address: str = ""):
     return next(iter(by_address.values()))
 
 
+def ldplayer_config(adb_path, address):
+    folder = Path(adb_path).parent
+    console = folder / "ldconsole.exe"
+    if not console.is_file() or not (folder / "ldopengl64.dll").is_file():
+        return {}
+
+    def query(*args):
+        return subprocess.run(
+            [str(console), *args], check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout.strip()
+
+    try:
+        matches = []
+        for line in query("list2").splitlines():
+            fields = line.split(",")
+            if len(fields) != 10 or fields[4] != "1":
+                continue
+            index, pid = int(fields[0]), int(fields[5])
+            if index < 0 or pid <= 0:
+                continue
+            # Verify the actual serial; do not infer the instance from an ADB port.
+            if query("adb", "--index", str(index), "--command", "get-serialno") == address:
+                matches.append({"enable": True, "path": str(folder), "index": index, "pid": pid})
+        return matches[0] if len(matches) == 1 else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
 class MaaSession:
     def __init__(self, config: dict[str, Any], *, execute: bool = False, api=None):
         self.cfg = config
@@ -105,13 +136,20 @@ class MaaSession:
                           screencap_methods=device.screencap_methods,
                           input_methods=device.input_methods, config=device.config)
         elif self.cfg["address"] and self.cfg["adb_path"]:
-            # Manual fallback uses ordinary ADB. No injection, root or emulator extras.
+            # Keep ordinary ADB available when emulator discovery fails.
             params = dict(adb_path=Path(self.cfg["adb_path"]), address=self.cfg["address"],
                           screencap_methods=self.api["Screen"].Encode,
                           input_methods=self.api["Input"].AdbShell, config={})
         else:
             raise QuizError("Device not found. Specify both adb_path and address for manual connection.")
         self.address = params["address"]
+        ld = ldplayer_config(params["adb_path"], self.address)
+        if ld:
+            params["config"] = {**params["config"], "extras": {
+                **params["config"].get("extras", {}), "ld": ld,
+            }}
+            # Maa speed-tests both paths and keeps ADB if the LD interface fails.
+            params["screencap_methods"] |= self.api["Screen"].EmulatorExtras
         self.controller = self.api["AdbController"](**params)
         if not self.controller.set_screenshot_use_raw_size(True):
             raise QuizError("Could not enforce a single raw screenshot/click coordinate space.")

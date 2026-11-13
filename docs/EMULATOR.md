@@ -17,6 +17,7 @@ Windows Python 程序
 
 可先测试你已经安装的 MuMu、雷电或蓝叠；不需要同时安装多个。
 设备发现走 MaaFramework 官方 Toolkit，手动回退走普通 ADB，未针对每个品牌做实机验证。
+雷电会按实际 ADB 序列号自动匹配运行实例，尝试 `LDPlayerExtras` 快速截图；初始化不可用时保留普通 ADB 通道。详见 [局部识别测试](LOCAL_VISION_TEST.md)。
 不要求 root、不修改游戏、不读取密码。普通 Android 真机通过 USB 调试也可作为后续测试目标，
 但本版布局来自横屏游戏截图，不保证所有设备布局都适配。
 Windows 手游桌面版不是 Android ADB 目标；本版尚未接入 Win32Controller。
