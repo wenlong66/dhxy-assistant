@@ -1,12 +1,14 @@
 """Screenshot-calibrated daily pickup and completion checks; no AI or combat input."""
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
 from dataclasses import asdict, dataclass
 
 from maa_adapter import save_image
+from local_vision import RegionOCR, VisionMetrics, VisionOptions, contains, scaled_roi
 from quiz_core import QuizError, normalize
 from quiz_vision import TextBlock, write_json
 
@@ -115,6 +117,44 @@ class DailyView:
         return [c for _, _, c in sorted(cards, key=lambda item: (round(item[0] / 40), item[1]))]
 
 
+class LocalDailyView(DailyView):
+    """Recognize only regions actually requested by the current flow state.
+
+    The Maa adapter returns boxes in full-image coordinates even with an ROI.
+    Region padding protects text edges; selection still uses the original ROI.
+    """
+
+    def __init__(self, frame, reader, captured_at):
+        super().__init__(frame, [], captured_at)
+        self.reader = reader
+        self.regions = []
+        self.generation = reader.generation
+
+    def inside(self, roi):
+        self.reader.check_stop()
+        if self.generation != self.reader.generation:
+            raise QuizError("日常画面已失效，请重新截图。")
+        roi = tuple(roi)
+        blocks = None
+        for known, values in self.regions:
+            if contains(known, roi):
+                blocks = values
+                self.reader.metrics.count("same_frame_region_hits")
+                break
+        if blocks is None:
+            device_roi = scaled_roi(roi, self.width, self.height, padding=4)
+            raw = self.reader.recognize(self.frame, device_roi, self.captured_at)
+            # First frame/geometry initialization increments the cache generation.
+            self.generation = self.reader.generation
+            blocks = DailyView(self.frame, raw, self.captured_at).blocks
+            self.regions.append((roi, blocks))
+            known = {(b.text, b.box) for b in self.blocks}
+            self.blocks.extend(b for b in blocks if (b.text, b.box) not in known)
+        x, y, w, h = roi
+        return [b for b in blocks if x <= b.box[0] + b.box[2] / 2 < x + w
+                and y <= b.box[1] + b.box[3] / 2 < y + h]
+
+
 def choose_task(cards, selected):
     pending = [c for c in cards if c.name in selected and not c.done]
     for name in ("卓越竞技场", "宝图任务"):
@@ -133,12 +173,16 @@ class DailyTimeout(QuizError):
 
 
 class DailyRunner:
-    def __init__(self, session, runtime_dir, should_stop, on_result=None):
+    def __init__(self, session, runtime_dir, should_stop, on_result=None, *, vision_options=None):
         self.session = session
         self.folder = runtime_dir / "daily"
         self.should_stop = should_stop
         self.on_result = on_result
         self.view = None
+        self._preview_at = float("-inf")
+        self.options = vision_options or VisionOptions.from_env()
+        self.metrics = VisionMetrics()
+        self.reader = RegionOCR(session, self.options, self.metrics, self.check_stop)
 
     def check_stop(self):
         if self.should_stop():
@@ -146,21 +190,59 @@ class DailyRunner:
 
     def emit(self, message):
         if self.on_result:
-            self.on_result({"message": message})
+            progress = {"message": message}
+            now = time.monotonic()
+            if self.view is not None and 0 <= now - self.view.captured_at <= 10 and now - self._preview_at >= 2:
+                # GUI may display this existing frame; never capture just for a log message.
+                progress["frame"] = self.view.frame
+                self._preview_at = now
+            started = time.perf_counter()
+            try:
+                self.on_result(progress)
+            finally:
+                self.metrics.duration("progress_callback", started)
 
     def read(self):
         self.check_stop()
-        frame = self.session.capture()
-        captured = time.monotonic()
-        blocks = self.session.ocr(frame, (0, 0, frame.shape[1], frame.shape[0]))
-        self.view = DailyView(frame, blocks, captured)
+        captured = time.monotonic()  # Includes acquisition time in staleness checks.
+        started = time.perf_counter()
+        try:
+            frame = self.session.capture()
+        finally:
+            self.metrics.duration("capture", started)
+        self.check_stop()
+        self.metrics.count("frames")
+        if self.options.mode == "full":
+            started = time.perf_counter()
+            try:
+                blocks = self.session.ocr(frame, (0, 0, frame.shape[1], frame.shape[0]))
+            finally:
+                self.metrics.duration("ocr", started)
+            self.metrics.count("ocr_pixels", frame.shape[1] * frame.shape[0])
+            self.view = DailyView(frame, blocks, captured)
+        else:
+            self.view = LocalDailyView(frame, self.reader, captured)
         self.check_stop()
         return self.view
 
+    def save_metrics(self):
+        report = self.metrics.report()
+        report.update(mode=self.options.mode, capture_scope="full_device_frame",
+                      recognition_scope="on_demand_roi" if self.options.mode == "roi" else "full_frame",
+                      options=asdict(self.options))
+        try:
+            write_json(self.folder / "performance.json", report)
+        except OSError:
+            # Diagnostics must not turn a successful/failed input into an automatic retry.
+            logging.getLogger(__name__).warning("Could not write daily performance diagnostics.")
+
     def save(self, error=""):
+        self.save_metrics()
         if self.view is not None:
             save_image(self.view.frame, self.folder / "screen.png")
             write_json(self.folder / "ocr.json", {"error": error, "reference_size": [834, 470],
+                                                 "partial_ocr": isinstance(self.view, LocalDailyView),
+                                                 "regions": [r for r, _ in getattr(self.view, "regions", [])],
                                                  "blocks": [asdict(b) for b in self.view.blocks]})
 
     def sleep(self, seconds):
@@ -172,11 +254,26 @@ class DailyRunner:
 
     def tap(self, view, box):
         self.check_stop()
-        if time.monotonic() - view.captured_at > 10:
+        age = time.monotonic() - view.captured_at
+        if age < 0 or age > 10:
             raise QuizError("日常截图已过期，未点击，请重新检查。")
+        if getattr(view, "_click_used", False) or (isinstance(view, LocalDailyView) and view.generation != self.reader.generation):
+            raise QuizError("当前画面已执行过点击或失效，必须重新截图。")
+        if box is None or len(box) != 4 or any(not math.isfinite(v) for v in box):
+            raise QuizError("无效的点击位置，未点击。")
         x, y, w, h = box
-        self.session.click(round((x + w / 2) * view.width / 834),
-                           round((y + h / 2) * view.height / 470))
+        if min(x, y) < 0 or min(w, h) <= 0 or x + w > 834 or y + h > 470:
+            raise QuizError("点击位置超出校准区域，未点击。")
+        view._click_used = True
+        started = time.perf_counter()
+        try:
+            self.session.click(round((x + w / 2) * view.width / 834),
+                               round((y + h / 2) * view.height / 470))
+        finally:
+            self.metrics.duration("click", started)
+            # Also invalidate after a failed/ambiguous input; never retry from this view.
+            self.reader.invalidate()
+        self.check_stop()
 
     def until(self, predicate, message, timeout=45):
         deadline = time.monotonic() + timeout
@@ -184,7 +281,7 @@ class DailyRunner:
             view = self.read()
             if predicate(view):
                 return view
-            self.sleep(0.5)
+            self.sleep(min(self.options.poll_seconds, max(0, deadline - time.monotonic())))
         raise DailyTimeout(message)
 
     def open_list(self):
@@ -234,13 +331,13 @@ class DailyRunner:
                 previous = None
                 last_error = str(exc)
             else:
-                signature = [(c.name, c.done, c.action) for c in cards]
+                signature = [(c.name, c.current, c.done, c.action, c.button) for c in cards]
                 if signature == previous:
                     return view, cards
                 previous = signature
             if time.monotonic() >= deadline:
                 raise QuizError("等待任务列表稳定超过 15 秒，未点击。" + last_error)
-            self.sleep(0.5)
+            self.sleep(self.options.poll_seconds)
             view = self.read()
 
     def pickup(self, view, card):
@@ -265,11 +362,29 @@ class DailyRunner:
 
     def wait_task(self, name):
         estimate = WAIT_SECONDS[name]
-        self.emit(f"{name}已开始，{estimate // 60} 分钟后首次核对完成状态；停止助手不会停止游戏内自动任务。")
+        early_probe = self.options.early_probe and name != "宝图任务"
+        if early_probe:
+            self.emit(f"{name}已开始，最长 {estimate // 60} 分钟后核对次数；期间只读检查完成提示，不操作战斗。")
+        else:
+            self.emit(f"{name}已开始，{estimate // 60} 分钟后首次核对完成状态；停止助手不会停止游戏内自动任务。")
         deadline = time.monotonic() + estimate
+        next_notice = time.monotonic() + 30
+        hints = 0
         while time.monotonic() < deadline:
-            self.sleep(min(30, deadline - time.monotonic()))
-            self.emit(f"等待{name}自动执行，距首次检查约 {max(0, round((deadline - time.monotonic()) / 60))} 分钟。")
+            interval = self.options.probe_seconds if early_probe else 30
+            self.sleep(min(interval, max(0, deadline - time.monotonic())))
+            if early_probe and time.monotonic() < deadline:
+                view = self.read()
+                # Absence of tracking alone is NOT completion (combat/occlusion).
+                terminal = view.text((60, 320, 650, 80)) if view.tracking() is None else ""
+                positive = "明天再来" in terminal and ("已完成" in terminal or "任务已完成" in terminal)
+                hints = hints + 1 if positive else 0
+                if hints >= 2:
+                    self.emit(f"检测到{name}完成提示，提前核对列表次数。")
+                    break
+            if time.monotonic() >= next_notice:
+                self.emit(f"等待{name}自动执行，距定时核对约 {max(0, round((deadline - time.monotonic()) / 60))} 分钟。")
+                next_notice = time.monotonic() + 30
         deadline = time.monotonic() + 300
         while True:
             view, cards = self.stable_list()
@@ -331,3 +446,5 @@ class DailyRunner:
         except QuizError as exc:
             self.save(str(exc))
             raise
+        finally:
+            self.save_metrics()
