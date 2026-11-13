@@ -11,10 +11,11 @@ from quiz_core import QuizError, normalize
 from quiz_vision import TextBlock, write_json
 
 TOTALS = {"帮派任务": 20, "五环任务": 1, "师门任务": 20, "宝图任务": 15, "卓越竞技场": 3}
-WAIT_SECONDS = {"帮派任务": 420, "五环任务": 180, "师门任务": 540}
+WAIT_SECONDS = {"帮派任务": 420, "五环任务": 180, "师门任务": 540, "宝图任务": 300}
 PICKUPS = {"帮派任务": ("帮派总管", "帮派任务"),
            "五环任务": ("云游大师", "我自己去拯救苍生！"),
-           "师门任务": ("聂小倩", "师门任务")}
+           "师门任务": ("聂小倩", "师门任务"),
+           "宝图任务": ("店小二", "宝图任务")}
 TABLE = (250, 58, 462, 282)
 DIALOG = (530, 160, 280, 300)
 TRACKER = (677, 104, 151, 104)
@@ -244,19 +245,27 @@ class DailyRunner:
 
     def pickup(self, view, card):
         if card.name not in PICKUPS:
-            raise QuizError("宝图普通领取流程尚未实测：请提供无扫帚时的领取对话和开始画面。")
+            raise QuizError(f"{card.name}没有已接入的普通领取流程。")
         self.tap(view, card.button)
         npc, option = PICKUPS[card.name]
+        if card.name == "宝图任务":
+            npc = "店小"  # The supplied screenshot's OCR omits the final 二.
         view = self.until(lambda v: v.tracking() == card.name or
                           (npc in v.text(DIALOG) and compact(option).rstrip("！!") in v.text(DIALOG)),
                           f"等待{card.name}领取对话超时，未重复领取。")
         if view.tracking() != card.name:
+            document_option = "宝图任务（文牒通关）"
+            if card.name == "宝图任务" and compact(document_option) in view.text(DIALOG):
+                self.emit("优先选择宝图任务（文牒通关），随后核对是否直接完成。")
+                self.tap(view, view.find(document_option, DIALOG))
+                return True
             self.tap(view, view.find(option, DIALOG))
             self.until(lambda v: v.tracking() == card.name, f"未确认{card.name}已开始，未重复领取。", 20)
+        return False
 
     def wait_task(self, name):
         estimate = WAIT_SECONDS[name]
-        self.emit(f"{name}已开始，约 {estimate // 60} 分钟后首次核对完成次数；停止助手不会停止游戏内自动任务。")
+        self.emit(f"{name}已开始，{estimate // 60} 分钟后首次核对完成状态；停止助手不会停止游戏内自动任务。")
         deadline = time.monotonic() + estimate
         while time.monotonic() < deadline:
             self.sleep(min(30, deadline - time.monotonic()))
@@ -310,8 +319,13 @@ class DailyRunner:
                     if not next(c for c in updated if c.name == card.name).done:
                         raise QuizError(f"扫帚操作后未确认{card.name}完成，未重复点击。")
                 else:
-                    self.pickup(view, card)
-                    self.wait_task(card.name)
+                    if self.pickup(view, card):
+                        self.sleep(0.5)
+                        _, updated = self.stable_list()
+                        if not next(c for c in updated if c.name == card.name).done:
+                            raise QuizError("文牒通关后未确认宝图完成，已暂停，未重复使用。")
+                    else:
+                        self.wait_task(card.name)
         except DailyStopped:
             return {"reason": "stopped"}
         except QuizError as exc:

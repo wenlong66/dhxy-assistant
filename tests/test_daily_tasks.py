@@ -94,6 +94,10 @@ class DailyParsingTests(unittest.TestCase):
             self.assertIsNotNone(current.find(option, (530, 160, 280, 300)))
         for name, frame in (("帮派任务", "guild_active"), ("五环任务", "five_active"), ("师门任务", "school_active")):
             self.assertEqual(view(frame).tracking(), name)
+        self.assertEqual(view("treasure_active").tracking(), "宝图任务")
+        treasure = view("treasure_dialog")
+        self.assertNotEqual(treasure.find("宝图任务", (530, 160, 280, 300)),
+                            treasure.find("宝图任务（文牒通关）", (530, 160, 280, 300)))
         self.assertTrue(view("dig_popup").dig_popup)
         with self.assertRaises(QuizError):
             view("dig_popup").cards()
@@ -211,7 +215,7 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(result["reason"], "completed")
         self.assertEqual(set(result["completed"]), set(TOTALS))
         self.assertEqual(result["pending"], [])
-        self.assertGreaterEqual(self.clock.now, sum(WAIT_SECONDS.values()))
+        self.assertGreaterEqual(self.clock.now, sum(WAIT_SECONDS[name] for name in ("帮派任务", "五环任务", "师门任务")))
         self.assertEqual(sum(scene == "dialog" for scene, _, _ in self.session.clicks), 3)
         self.assertEqual(sum(scene == "dig_popup" for scene, _, _ in self.session.clicks), 1)
 
@@ -288,12 +292,57 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(self.runner.run(list(TOTALS))["reason"], "completed")
         self.assertEqual(self.session.clicks, [])
 
-    def test_missing_treasure_pickup_stops_without_clicking(self):
-        self.session.list_name = "after_arena"
-        with self.assertRaisesRegex(QuizError, "宝图普通领取"):
-            self.runner.run(["宝图任务"])
-        self.assertEqual(self.session.clicks, [])
-        self.assertTrue((self.runner.folder / "ocr.json").exists())
+    def test_normal_treasure_pickup_checks_completion_after_fixed_five_minutes(self):
+        dialog = view("treasure_dialog")
+        dialog.blocks = [b for b in dialog.blocks if "文牒" not in b.text]
+        checks = []
+        def list_view():
+            checks.append(self.clock.now)
+            current = view("after_arena" if self.clock.now < 300 else "finished")
+            return current, current.cards()
+        with patch.object(self.runner, "read", return_value=view("after_arena")), \
+                patch.object(self.runner, "stable_list", side_effect=list_view), \
+                patch.object(self.runner, "until", side_effect=[dialog, view("treasure_active")]), \
+                patch.object(self.runner, "tap") as tap:
+            result = self.runner.run(["宝图任务"])
+        self.assertEqual(result["reason"], "completed")
+        self.assertEqual(checks, [0, 300, 300])
+        self.assertEqual(tap.call_count, 2)
+        self.assertEqual(tap.call_args.args[1], dialog.find("宝图任务", (530, 160, 280, 300)))
+
+    def test_treasure_document_has_priority_and_verifies_without_five_minute_wait(self):
+        initial, finished = view("after_arena"), view("finished")
+        dialog = view("treasure_dialog")
+        with patch.object(self.runner, "read", return_value=initial), \
+                patch.object(self.runner, "stable_list", side_effect=[(initial, initial.cards()),
+                    (finished, finished.cards()), (finished, finished.cards())]), \
+                patch.object(self.runner, "until", return_value=dialog), \
+                patch.object(self.runner, "tap") as tap:
+            result = self.runner.run(["宝图任务"])
+        self.assertEqual(result["reason"], "completed")
+        self.assertLess(self.clock.now, 1)
+        self.assertEqual(tap.call_count, 2)
+        self.assertEqual(tap.call_args.args[1], dialog.find("宝图任务（文牒通关）", (530, 160, 280, 300)))
+
+    def test_treasure_document_without_completion_does_not_repeat(self):
+        initial = view("after_arena")
+        with patch.object(self.runner, "read", return_value=initial), \
+                patch.object(self.runner, "stable_list", return_value=(initial, initial.cards())), \
+                patch.object(self.runner, "until", return_value=view("treasure_dialog")), \
+                patch.object(self.runner, "tap") as tap:
+            with self.assertRaisesRegex(QuizError, "文牒通关后未确认"):
+                self.runner.run(["宝图任务"])
+        self.assertEqual(tap.call_count, 2)
+
+    def test_active_treasure_waits_five_minutes_without_picking_up_again(self):
+        finished = view("finished")
+        with patch.object(self.runner, "read", return_value=view("treasure_active")), \
+                patch.object(self.runner, "stable_list", return_value=(finished, finished.cards())), \
+                patch.object(self.runner, "tap") as tap:
+            result = self.runner.run(["宝图任务"])
+        self.assertEqual(result["reason"], "completed")
+        self.assertEqual(self.clock.now, 300)
+        tap.assert_not_called()
 
     def test_no_broom_does_not_claim_arena_completed(self):
         self.session.list_name = "after_arena"

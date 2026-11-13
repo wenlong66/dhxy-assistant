@@ -272,10 +272,12 @@ class MainWindow(QMainWindow):
         task_l.addWidget(self.dali_check)
         self.daily_checks = {}
         for name, label in (("师门任务", "师门任务"), ("帮派任务", "帮派任务"),
-                            ("宝图任务", "宝图任务（仅金扫帚）"), ("五环任务", "五环任务"),
+                            ("宝图任务", "宝图任务"), ("五环任务", "五环任务"),
                             ("卓越竞技场", "卓越竞技场（仅金扫帚）")):
             check = QCheckBox(label)
             check.setChecked(True)
+            if name == "宝图任务":
+                check.setToolTip("优先使用已有扫帚；领取时优先文牒通关，否则普通领取后等待 5 分钟再检查。")
             self.daily_checks[name] = check
             task_l.addWidget(check)
         task_note = QLabel("日常按当前列表顺序；自动用已有金扫帚，优先竞技场、宝图。大理寺单独启动。")
