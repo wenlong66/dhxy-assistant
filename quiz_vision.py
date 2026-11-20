@@ -12,6 +12,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from quiz_core import Question, QuizError, QuizStore, digest, game_day, normalize
+from quiz_feedback import correct_choice
+
+INPUT_PAUSE_SECONDS = (0.3, 1.0)
 
 
 class ReadError(QuizError):
@@ -85,6 +88,8 @@ class Observation:
     buttons: dict[str, tuple[int, int, int, int]]
     captured_at: float
     frame: object = None
+    question_roi: tuple[int, int, int, int] | None = None
+    option_rois: dict[str, tuple[int, int, int, int]] | None = None
 
     @property
     def signature(self):
@@ -95,7 +100,10 @@ def option_labels(fields, minimum):
     # Count through the last visible option; gaps and partially read answers still fail validation.
     labels = "AB"
     for k in "CD":
-        text = any(b.text.strip() for b in fields.get(f"option_{k}", []))
+        # Empty gold regions can produce a weak dash; retain real text and trusted punctuation.
+        text = any(b.text.strip() and (b.score >= minimum or re.search(r"\w", b.text)
+                                      or not re.fullmatch(r"[-－—–]+", b.text.strip()))
+                   for b in fields.get(f"option_{k}", []))
         label = any(b.text.strip() and (b.score >= minimum or re.search(r"\w", b.text))
                     for b in fields.get(f"label_{k}", []))
         if text or label:
@@ -106,9 +114,7 @@ def option_labels(fields, minimum):
 def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
                  captured_at: float, frame=None, *, random_answer=False) -> Observation:
     labels = option_labels(fields, layout.minimum)
-    names = [f"label_{k}" for k in labels]
-    if not random_answer:
-        names = ["question", *names, *[f"option_{k}" for k in labels]]
+    names = ["question", *[f"label_{k}" for k in labels], *[f"option_{k}" for k in labels]]
     text = {}
     for name in names:
         try:
@@ -118,28 +124,18 @@ def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
     for label in labels:
         if normalize(text[f"label_{label}"]).upper() != label:
             raise QuizError(f"Option {label} label is missing/misaligned; inspect the layout.")
-    if random_answer:
-        matches = []
-        for block in fields.get("question", []):
-            found = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题", unicodedata.normalize("NFKC", block.text).strip())
-            if found:
-                join_blocks([block], layout.minimum)
-                matches.append(found)
-        if len(matches) != 1:
-            raise QuizError("无法确认当前题号，暂不随机点击。")
-        match = matches[0]
-        stem = f"第{int(match[1])}/{int(match[2])}题:随机答题 {game_day()} {int(match[1])}/{int(match[2])}"
-    else:
-        stem = unicodedata.normalize("NFKC", text["question"])
-        match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题\s*:\s*(.+)$", stem, re.S)
+    stem = unicodedata.normalize("NFKC", text["question"])
+    match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题\s*:\s*(.+)$", stem, re.S)
     if not match or not 1 <= int(match[1]) <= int(match[2]) <= 100:
         raise QuizError("Question number or full question text was not recognized.")
     # Stable across process restarts: same account/day/instance/question number cannot be re-clicked.
     instance = digest([game_day(), scope, device_id, int(match[1]), int(match[2])])
-    options = tuple((k, f"选项{k}" if random_answer else re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
+    options = tuple((k, re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
     question = Question(stem, options, instance, scope=scope)
     buttons = layout.scaled(*size, group="buttons")
-    return Observation(question, tuple(size), {k: buttons[k] for k in labels}, captured_at, frame)
+    return Observation(question, tuple(size), {k: buttons[k] for k in labels}, captured_at, frame,
+                       layout.scaled(*size)["question"],
+                       {k: layout.scaled(*size)[f"option_{k}"] for k in labels})
 
 
 class QuizReader:
@@ -152,10 +148,6 @@ class QuizReader:
         captured_at = time.monotonic()
         height, width = frame.shape[:2]
         rois = self.layout.scaled(width, height)
-        if self.random_answer:
-            rois = {name: roi for name, roi in rois.items() if name == "question" or name.startswith("label_")}
-            x, y, w, h = rois["question"]
-            rois["question"] = (x, y, min(w, round(90 * width / self.layout.width)), h)
         fields = {name: self.session.ocr(frame, roi, single_line=name.startswith("label_"))
                   for name, roi in rois.items()}
         return frame, captured_at, fields, rois
@@ -205,10 +197,57 @@ def write_json(path: Path, data):
     tmp.replace(path)
 
 
+def random_click_point(box):
+    x, y, w, h = box
+    inset_x = min(max(1, w // 10), (w - 1) // 2)
+    inset_y = min(max(1, h // 10), (h - 1) // 2)
+    return (random.randint(x + inset_x, x + w - 1 - inset_x),
+            random.randint(y + inset_y, y + h - 1 - inset_y))
+
+
+def record_revealed_feedback(session, store, observation, attempt_id, selected_label, *, sleep, require_active):
+    if observation.frame is None or observation.question_roi is None or observation.option_rois is None:
+        return "awaiting_manual_feedback"
+    if any(correct_choice(observation.frame, box) for box in observation.buttons.values()):
+        return "awaiting_manual_feedback"
+    for _ in range(5):
+        require_active()
+        frame = session.capture()
+        require_active()
+        if tuple(frame.shape[:2][::-1]) != observation.size:
+            return "awaiting_manual_feedback"
+        try:
+            stem = join_blocks(session.ocr(frame, observation.question_roi), .8)
+        except QuizError:
+            return "awaiting_manual_feedback"
+        if normalize(stem) != normalize(observation.question.stem):
+            return "awaiting_manual_feedback"
+        labels = [label for label, box in observation.buttons.items() if correct_choice(frame, box)]
+        if len(labels) > 1:
+            return "awaiting_manual_feedback"
+        if labels:
+            label = labels[0]
+            answer = dict(observation.question.options)[label]
+            try:
+                current_answer = join_blocks(session.ocr(frame, observation.option_rois[label]), .8)
+            except QuizError:
+                return "awaiting_manual_feedback"
+            if normalize(current_answer.replace("\n", "")) != normalize(answer):
+                return "awaiting_manual_feedback"
+            require_active()
+            outcome = "correct" if label == selected_label else "wrong"
+            evidence = f"同一题目出现唯一正确对勾：选项{label}。"
+            store.feedback(attempt_id, outcome, evidence, source="game_ui")
+            store.learn_revealed_answer(observation.question, answer, evidence)
+            return outcome
+        sleep(.1)
+    return "awaiting_manual_feedback"
+
+
 def answer_once(reader, session, store: QuizStore, *, provider=None, execute=False,
                 layout_confirmed=False, allow_trial=False, max_daily_calls=30, random_answer=False,
                 receipt_dir: Path = Path("data/receipts"), sleep=time.sleep,
-                should_stop=None, expected_view_token=None):
+                should_stop=None, expected_view_token=None, random_percentage=None):
     def require_active():
         if should_stop is not None and should_stop():
             raise QuizError("Operation cancelled; no game click sent.")
@@ -224,7 +263,8 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     if expected_view_token is not None and stable.question.view_token != expected_view_token:
         raise ReadError("题目已切换，当前提交取消；未调用 AI 或点击游戏。")
     decision = store.resolve(stable.question, provider, allow_trial=allow_trial,
-                             max_daily_calls=max_daily_calls, random_answer=random_answer)
+                             max_daily_calls=max_daily_calls, random_answer=random_answer,
+                             random_percentage=random_percentage)
     require_active()  # Especially important after the potentially slow, paid API request.
     result = {"decision": decision.to_dict(), "click_sent": False, "outcome": "not_submitted"}
     if not execute or not decision.can_submit:
@@ -233,7 +273,13 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     # AI may take time; never use an old frame or letter-to-button mapping.
     current = reader.read()
     assert_same(stable, current)
-    sleep(0.25)
+    remaining = random.uniform(*INPUT_PAUSE_SECONDS)
+    while remaining > 0:
+        require_active()
+        interval = min(.1, remaining)
+        sleep(interval)
+        remaining -= interval
+    require_active()
     final = reader.read()
     assert_same(current, final)
     label = final.question.label_for(decision.answer_text)
@@ -242,10 +288,9 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     x, y, w, h = final.buttons[label]
     if min(w, h) <= 0 or min(x, y) < 0 or x + w > final.size[0] or y + h > final.size[1]:
         raise QuizError("Answer button is outside screenshot.")
-    inset_x = min(max(1, w // 10), (w - 1) // 2)
-    inset_y = min(max(1, h // 10), (h - 1) // 2)
-    point = (random.randint(x + inset_x, x + w - 1 - inset_x),
-             random.randint(y + inset_y, y + h - 1 - inset_y))
+    if any(correct_choice(final.frame, box) for box in final.buttons.values()):
+        raise ReadError("当前题目已显示正确答案，未再次点击。")
+    point = random_click_point(final.buttons[label])
     receipt = receipt_dir / f"{decision.attempt_id}.json"
     result.update(target=list(point), outcome="prepared", question_key=final.question.key)
     # Persist intent before claiming or touching the game; disk errors must prevent a click.
@@ -263,5 +308,7 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
         raise
     result.update(click_sent=True, outcome="awaiting_manual_feedback", receipt=str(receipt))
     write_json(receipt, result)
-    # A successful input job is NOT a correct answer. No speculative auto-feedback.
+    result = {**result, "outcome": record_revealed_feedback(session, store, final, decision.attempt_id, label,
+                                                          sleep=sleep, require_active=require_active)}
+    write_json(receipt, result)
     return result

@@ -268,7 +268,8 @@ class QuizStore:
             label TEXT NOT NULL, view_token TEXT NOT NULL, eligible INTEGER NOT NULL,
             origin TEXT NOT NULL, created_at TEXT NOT NULL, submitted_at TEXT,
             outcome TEXT NOT NULL DEFAULT 'pending', evidence TEXT NOT NULL DEFAULT '',
-            feedback_source TEXT NOT NULL DEFAULT '', instance_token TEXT NOT NULL DEFAULT ''
+            feedback_source TEXT NOT NULL DEFAULT '', instance_token TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '', stem TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS requests(
             id TEXT PRIMARY KEY, qkey TEXT NOT NULL, game_day TEXT NOT NULL,
@@ -279,8 +280,10 @@ class QuizStore:
         CREATE INDEX IF NOT EXISTS requests_day ON requests(game_day);
         """)
         with self.transaction() as db:
-            if "instance_token" not in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}:
-                db.execute("ALTER TABLE attempts ADD COLUMN instance_token TEXT NOT NULL DEFAULT ''")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
+            for column in ("instance_token", "scope", "stem", "options_json"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE attempts ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def transaction(self):
@@ -304,25 +307,53 @@ class QuizStore:
         attempt_id = None
         if label and row["status"] in {"candidate", "verified"}:
             attempt_id = uuid.uuid4().hex
-            db.execute("INSERT INTO attempts(id,qkey,answer_text,label,view_token,eligible,origin,created_at,instance_token) VALUES(?,?,?,?,?,?,?,?,?)",
-                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now(), digest([q.scope, q.instance_id])))
+            db.execute("""INSERT INTO attempts(id,qkey,answer_text,label,view_token,eligible,origin,created_at,instance_token,scope,stem,options_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now(), digest([q.scope, q.instance_id]),
+                        q.scope, question_body(q.stem), json.dumps(dict(q.options), ensure_ascii=False)))
         return Decision(q.key, q.view_token, answer, label, row["status"], origin,
                         row["reason"], attempt_id, eligible)
+
+    def _random_decision(self, db, q: Question) -> Decision:
+        previous = db.execute(
+            "SELECT answer_text FROM attempts WHERE view_token=? AND origin='random' ORDER BY rowid DESC LIMIT 1",
+            (q.view_token,),
+        ).fetchone()
+        answer = previous["answer_text"] if previous else random.choice(q.options)[1]
+        return self._decision(db, q, {"answer_text": answer, "status": "candidate",
+                                     "reason": "随机选择；未判断答案是否正确。"}, "random", True)
 
     def resolve(self, q: Question, provider: AnswerProvider | None = None, *,
                 image: Path | None = None, allow_trial: bool = False,
                 refresh: bool = False, max_daily_calls: int = 30,
-                random_answer: bool = False) -> Decision:
+                random_answer: bool = False, random_percentage: int | None = None) -> Decision:
+        if random_percentage is not None and (isinstance(random_percentage, bool)
+                or not isinstance(random_percentage, int) or not 0 <= random_percentage <= 100):
+            raise QuizError("random_percentage must be an integer from 0 to 100.")
         request_id = uuid.uuid4().hex
         with self.transaction() as db:
-            if random_answer:
+            if random_percentage is not None:
                 previous = db.execute(
-                    "SELECT answer_text FROM attempts WHERE view_token=? AND origin='random' ORDER BY rowid DESC LIMIT 1",
+                    "SELECT * FROM attempts WHERE view_token=? AND origin IN ('random','bank') ORDER BY rowid DESC LIMIT 1",
                     (q.view_token,),
                 ).fetchone()
-                answer = previous["answer_text"] if previous else random.choice(q.options)[1]
-                return self._decision(db, q, {"answer_text": answer, "status": "candidate",
-                                             "reason": "随机选择；未判断答案是否正确。"}, "random", True)
+                if previous:
+                    bank = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone() if previous["origin"] == "bank" else None
+                    status = (bank["status"] if bank else "miss") if previous["origin"] == "bank" else "candidate"
+                    eligible = bool(previous["eligible"] and q.label_for(previous["answer_text"]) == previous["label"]
+                                    and (previous["origin"] == "random" or
+                                         (bank and bank["status"] == "verified" and bank["answer_text"] == previous["answer_text"])))
+                    return Decision(q.key, q.view_token, previous["answer_text"], previous["label"], status,
+                                    previous["origin"], bank["reason"] if bank else "随机选择；未判断答案是否正确。",
+                                    previous["id"], eligible)
+                if random_percentage == 100 or (random_percentage > 0 and random.randrange(100) < random_percentage):
+                    return self._random_decision(db, q)
+                row = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone()
+                if row and row["status"] == "verified" and row["answer_text"] and q.label_for(row["answer_text"]):
+                    return self._decision(db, q, row, "bank", False)
+                return self._random_decision(db, q)
+            if random_answer:
+                return self._random_decision(db, q)
             row = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone()
             if row and (not refresh or row["status"] == "asking"):
                 return self._decision(db, q, row, "cache", allow_trial)
@@ -338,7 +369,7 @@ class QuizStore:
                 answer_text=NULL,status='asking',reason='',updated_at=excluded.updated_at""",
                        (q.key, q.scope, question_body(q.stem), json.dumps(dict(q.options), ensure_ascii=False), utc_now()))
             db.execute("INSERT INTO requests(id,qkey,game_day,state) VALUES(?,?,?,'started')", (request_id, q.key, game_day()))
-            rejected = [r[0] for r in db.execute("SELECT DISTINCT answer_text FROM attempts WHERE qkey=? AND outcome='wrong'", (q.key,))]
+            rejected = [r[0] for r in db.execute("SELECT DISTINCT answer_text FROM attempts WHERE qkey=? AND outcome='wrong' AND origin!='random'", (q.key,))]
         try:
             answer = provider.answer(q, rejected, image)
             if answer.decision not in {"answer", "abstain"}:
@@ -392,7 +423,8 @@ class QuizStore:
                 return False
             bank = db.execute("SELECT status,answer_text FROM answers WHERE qkey=?", (current.key,)).fetchone()
             if row["origin"] != "random" and (not bank or bank["answer_text"] != row["answer_text"]
-                                               or bank["status"] not in {"candidate", "verified"}):
+                                               or bank["status"] not in {"candidate", "verified"}
+                                               or (row["origin"] == "bank" and bank["status"] != "verified")):
                 return False
             unresolved = db.execute("SELECT 1 FROM attempts WHERE qkey=? AND submitted_at IS NOT NULL AND outcome='pending'", (current.key,)).fetchone()
             if unresolved:
@@ -403,6 +435,52 @@ class QuizStore:
                 return False
             db.execute("UPDATE attempts SET submitted_at=? WHERE id=?", (utc_now(), decision.attempt_id))
             return True
+
+    def _learn_random(self, db, row, source: str) -> None:
+        if any(not isinstance(row[field], str) or not row[field].strip() for field in ("scope", "stem", "options_json")):
+            return
+        try:
+            snapshot = Question.from_dict({"scope": row["scope"], "stem": row["stem"],
+                                           "options": json.loads(row["options_json"]), "instance_id": "snapshot"})
+        except (QuizError, ValueError, TypeError):
+            return
+        # Old random readers supplied placeholders, not actual question/option text.
+        if (normalize(question_body(snapshot.stem)) == "随机答题" or snapshot.key != row["qkey"]
+                or dict(snapshot.options).get(row["label"]) != row["answer_text"]):
+            return
+        self._learn_verified(db, snapshot, row["answer_text"], "Confirmed by " + source)
+
+    def _learn_verified(self, db, q: Question, answer_text: str, reason: str) -> None:
+        current = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone()
+        if current and current["status"] == "asking":
+            return
+        conflict = db.execute("""SELECT 1 FROM attempts WHERE qkey=? AND answer_text=?
+            AND outcome='wrong' AND origin!='random'""", (q.key, answer_text)).fetchone()
+        different = bool(current and current["answer_text"] and normalize(current["answer_text"]) != normalize(answer_text))
+        protected = bool(different and current["status"] in {"verified", "needs_review"})
+        state = "needs_review" if conflict or protected else "verified"
+        reason = "Conflicting feedback." if conflict or protected else reason
+        if current:
+            # Preserve trusted/conflicting records; replace only an unverified answer.
+            db.execute("UPDATE answers SET status=?,reason=?,updated_at=? WHERE qkey=?",
+                       (state, reason, utc_now(), q.key))
+            if not conflict and not protected and (different or not current["answer_text"]):
+                db.execute("""UPDATE answers SET scope=?,stem=?,options_json=?,answer_text=?,model='' WHERE qkey=?""",
+                           (q.scope, question_body(q.stem), json.dumps(dict(q.options), ensure_ascii=False), answer_text, q.key))
+        else:
+            db.execute("""INSERT INTO answers(qkey,scope,stem,options_json,answer_text,status,reason,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)""", (q.key, q.scope, question_body(q.stem),
+                                          json.dumps(dict(q.options), ensure_ascii=False), answer_text, state, reason, utc_now()))
+
+    def learn_revealed_answer(self, q: Question, answer_text: str, evidence: str) -> None:
+        """Store an explicit correct-option reveal, never inferred from a wrong/next view."""
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise QuizError("Describe the actual correct-option reveal.")
+        label = q.label_for(answer_text) if isinstance(answer_text, str) else None
+        if label is None:
+            raise QuizError("Revealed answer must uniquely match an actual option.")
+        with self.transaction() as db:
+            self._learn_verified(db, q, dict(q.options)[label], "Confirmed by game_ui: " + evidence)
 
     def feedback(self, attempt_id: str, outcome: str, evidence: str, *, source: str = "manual") -> None:
         """Record feedback only from a human or a verified UI feedback adapter.
@@ -427,6 +505,8 @@ class QuizStore:
             db.execute("UPDATE attempts SET outcome=?,evidence=?,feedback_source=? WHERE id=?",
                        (outcome, evidence, source, attempt_id))
             if row["origin"] == "random":
+                if outcome == "correct":
+                    self._learn_random(db, row, source)
                 return
             # Ignore a stale attempt if a different candidate is now in the bank.
             current = db.execute("SELECT answer_text FROM answers WHERE qkey=?", (row["qkey"],)).fetchone()
@@ -436,7 +516,7 @@ class QuizStore:
                 db.execute("UPDATE answers SET status='invalid',reason='Explicit wrong-answer feedback.',updated_at=? WHERE qkey=?", (utc_now(), row["qkey"]))
             elif outcome == "correct":
                 # Conflicting authoritative feedback requires review, not blind overwrite.
-                conflict = db.execute("SELECT 1 FROM attempts WHERE qkey=? AND answer_text=? AND outcome='wrong'", (row["qkey"], row["answer_text"])).fetchone()
+                conflict = db.execute("SELECT 1 FROM attempts WHERE qkey=? AND answer_text=? AND outcome='wrong' AND origin!='random'", (row["qkey"], row["answer_text"])).fetchone()
                 state = "needs_review" if conflict else "verified"
                 db.execute("UPDATE answers SET status=?,reason=?,updated_at=? WHERE qkey=?",
                            (state, "Conflicting feedback." if conflict else "Confirmed by " + source, utc_now(), row["qkey"]))

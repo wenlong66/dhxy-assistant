@@ -104,20 +104,17 @@ class GuiLayoutTests(unittest.TestCase):
         def check_layout(app):
             window = next(w for w in app.topLevelWidgets() if isinstance(w, gui_app.MainWindow))
             try:
-                window.ai_enabled.setChecked(True)
-                window.model_edit.clear()
                 window.random_answer.setChecked(True)
-                self.assertFalse(window.ai_enabled.isEnabled())
-                self.assertFalse(window.allow_trial.isEnabled())
+                self.assertFalse(window.random_percentage.isEnabled())
                 params = window.answer_params(execute=False)
-                self.assertTrue(params["random_answer"])
-                self.assertFalse(params["use_ai"])
+                self.assertEqual(params["random_percentage"], 100)
                 automatic = window.answer_params(execute=True, automatic=True)
                 self.assertTrue(automatic["layout_confirmed"])
-                self.assertFalse(automatic["use_ai"])
+                self.assertEqual(automatic["random_percentage"], 100)
                 self.assertTrue(window.answer_params(execute=True)["layout_confirmed"])
                 window.random_answer.setChecked(False)
-                window.ai_enabled.setChecked(False)
+                self.assertTrue(window.random_percentage.isEnabled())
+                window.random_percentage.setValue(50)
                 window.layout_confirmed.setChecked(True)
                 with self.assertRaisesRegex(gui_app.QuizError, "题目 OCR 尚未通过"):
                     window.answer_params(execute=True)
@@ -126,24 +123,13 @@ class GuiLayoutTests(unittest.TestCase):
                 with self.assertRaisesRegex(gui_app.QuizError, "再勾选"):
                     window.answer_params(execute=True)
                 window.layout_confirmed.setChecked(True)
-                self.assertTrue(window.answer_params(execute=True)["layout_confirmed"])
+                self.assertEqual(window.answer_params(execute=True)["random_percentage"], 50)
                 window.last_inspection_valid = False
                 window.layout_confirmed.setChecked(False)
-                window.random_answer.setChecked(False)
-                self.assertTrue(window.ai_enabled.isEnabled())
-                window.ai_enabled.setChecked(False)
-                window.last_inspection_valid = True
-                window.layout_confirmed.setChecked(True)
-                with self.assertRaisesRegex(gui_app.QuizError, "模型 ID"):
-                    window.answer_params(execute=True, automatic=True)
-                window.model_edit.setText("test-model")
                 automatic = window.answer_params(execute=True, automatic=True)
-                self.assertTrue(automatic["use_ai"])
-                self.assertTrue(automatic["allow_trial"])
+                self.assertEqual(automatic["random_percentage"], 50)
+                self.assertNotIn("api_key", automatic)
                 window.random_answer.setChecked(True)
-                self.assertFalse(window.answer_params(execute=True, automatic=True)["use_ai"])
-                window.last_inspection_valid = False
-                window.layout_confirmed.setChecked(False)
                 with patch.object(gui_app.QMessageBox, "question", return_value=gui_app.QMessageBox.StandardButton.Yes), \
                         patch.object(window, "run_command") as run:
                     window.start_auto_answer()
@@ -153,14 +139,37 @@ class GuiLayoutTests(unittest.TestCase):
                     window.start_daily()
                 self.assertEqual(run.call_args.args[0], "auto_daily")
                 self.assertEqual(set(run.call_args.kwargs["selected"]), set(window.daily_checks))
+                self.assertEqual(run.call_args.kwargs["task_interval_max"], 300)
+                self.assertEqual(window.daily_interval_max.minimum(), 10)
+                window.daily_interval_max.setValue(90)
+                with patch.object(window, "run_command") as interval_run:
+                    window.start_daily()
+                self.assertEqual(interval_run.call_args.kwargs["task_interval_max"], 90)
+                window.daily_interval_max.setValue(300)
+                self.assertIn("大理寺答题", run.call_args.kwargs["selected"])
+                self.assertIs(window.daily_checks["大理寺答题"], window.dali_check)
+                window.dali_check.setChecked(False)
+                with patch.object(window, "run_command") as run:
+                    window.start_daily()
+                self.assertNotIn("大理寺答题", run.call_args.kwargs["selected"])
+                window.dali_check.setChecked(True)
                 self.assertNotIn("api_key", run.call_args.kwargs)
+                window.dali_check.setChecked(False)
+                with patch.object(window, "run_command") as run:
+                    window.start_ring()
+                self.assertEqual(run.call_args.args[0], "auto_ring")
+                self.assertEqual(run.call_args.kwargs["random_percentage"], 100)
+                window.dali_check.setChecked(True)
                 window.connected = True
                 window.current_busy = True
                 window._refresh_controls()
                 self.assertFalse(window.auto_btn.isEnabled())
                 self.assertFalse(window.random_answer.isEnabled())
+                self.assertFalse(window.random_percentage.isEnabled())
                 self.assertFalse(window.daily_start_btn.isEnabled())
+                self.assertFalse(window.ring_start_btn.isEnabled())
                 self.assertFalse(window.daily_inspect_btn.isEnabled())
+                self.assertFalse(window.daily_interval_max.isEnabled())
                 self.assertTrue(all(not check.isEnabled() for check in window.daily_checks.values()))
                 window.on_event("daily_progress", {"message": "等待师门"})
                 self.assertTrue(window.current_busy)
@@ -182,7 +191,7 @@ class GuiLayoutTests(unittest.TestCase):
                                                    window.preview_label.width() * 1.5)
                                 self.assertEqual(
                                     window.dali_check.parentWidget().mapTo(window, QPoint()).y(),
-                                    window.ai_enabled.parentWidget().mapTo(window, QPoint()).y(),
+                                    window.random_percentage.parentWidget().mapTo(window, QPoint()).y(),
                                     "Task selection and answer controls should be side by side",
                                 )
                         for widget in window.findChildren(QWidget):

@@ -262,6 +262,44 @@ class LocalDailyTests(unittest.TestCase):
             self.runner.read()
         self.session.ocr.assert_not_called()
 
+    def test_confirmed_tasks_probe_every_five_seconds_by_default(self):
+        finished = view("finished")
+        for name, seconds in (("帮派任务", 420), ("师门任务", 540), ("五环任务", 180), ("宝图任务", 300)):
+            with self.subTest(task=name), patch.dict(os.environ, {}, clear=True):
+                clock = Clock()
+                captured_at = Mock()
+                def capture():
+                    captured_at(clock.now)
+                    return self.frame
+                session = SimpleNamespace(capture=Mock(side_effect=capture),
+                                          ocr=Mock(return_value=self.session.ocr.return_value), click=Mock())
+                runner = DailyRunner(session, Path(self.tmp.name), lambda: False)
+                with patch("daily_tasks.time.monotonic", clock.monotonic), \
+                     patch("daily_tasks.time.sleep", clock.sleep), \
+                     patch.object(runner, "stable_list", return_value=(finished, finished.cards())) as verify:
+                    runner.wait_task(name)
+                times = [call.args[0] for call in captured_at.call_args_list]
+                self.assertEqual(len(times), seconds // 5 - 1)
+                for previous, current in zip([0, *times], times):
+                    self.assertAlmostEqual(current - previous, 5, delta=0.002)
+                verify.assert_called_once_with()
+                session.click.assert_not_called()
+
+    def test_stop_interrupts_confirmed_task_wait_without_capture(self):
+        from daily_tasks import DailyStopped
+        clock = Clock()
+        with patch.dict(os.environ, {}, clear=True):
+            runner = DailyRunner(self.session, Path(self.tmp.name), lambda: clock.now >= 1)
+        with patch("daily_tasks.time.monotonic", clock.monotonic), \
+             patch("daily_tasks.time.sleep", clock.sleep), patch.object(runner, "stable_list") as verify:
+            with self.assertRaises(DailyStopped):
+                runner.wait_task("帮派任务")
+        self.assertLessEqual(clock.now, 1.2)
+        verify.assert_not_called()
+        self.session.capture.assert_not_called()
+        self.session.ocr.assert_not_called()
+        self.session.click.assert_not_called()
+
     def test_early_completion_is_hint_then_list_verification(self):
         clock = Clock()
         session = ReplaySession(clock)
@@ -282,17 +320,18 @@ class LocalDailyTests(unittest.TestCase):
         self.assertGreaterEqual(clock.now, 180)
         self.session.click.assert_not_called()
 
-    def test_treasure_keeps_fixed_five_minutes_despite_early_probe(self):
+    def test_treasure_completion_popup_triggers_early_list_verification(self):
         clock = Clock()
-        runner = DailyRunner(self.session, Path(self.tmp.name), lambda: False,
-                             vision_options=VisionOptions(early_probe=True))
+        with patch.dict(os.environ, {}, clear=True):
+            runner = DailyRunner(self.session, Path(self.tmp.name), lambda: False)
         finished = view("finished")
         with patch("daily_tasks.time.monotonic", clock.monotonic), patch("daily_tasks.time.sleep", clock.sleep), \
-             patch.object(runner, "read", return_value=view("school_end")) as read, \
-             patch.object(runner, "stable_list", return_value=(finished, finished.cards())):
+             patch.object(runner, "read", return_value=view("dig_popup")) as read, \
+             patch.object(runner, "stable_list", return_value=(finished, finished.cards())) as verify:
             runner.wait_task("宝图任务")
-        self.assertEqual(clock.now, 300)
-        read.assert_not_called()
+        self.assertEqual(clock.now, 5)
+        read.assert_called_once_with()
+        verify.assert_called_once_with()
         self.session.click.assert_not_called()
 
 
@@ -315,6 +354,12 @@ class GeometryAndConfigTests(unittest.TestCase):
                         {"poll_seconds": 0}, {"probe_seconds": 0}, {"early_probe": "yes"}):
             with self.subTest(options=options), self.assertRaises(QuizError):
                 VisionOptions(**options)
+
+    def test_default_probe_is_enabled_with_five_second_interval(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for options in (VisionOptions(), VisionOptions.from_env()):
+                self.assertTrue(options.early_probe)
+                self.assertEqual(options.probe_seconds, 5)
 
     def test_environment_can_disable_cache_and_early_probe(self):
         with patch.dict(os.environ, {"DHXY_VISION_MODE": "full", "DHXY_CACHE_SECONDS": "0", "DHXY_EARLY_PROBE": "0"}):

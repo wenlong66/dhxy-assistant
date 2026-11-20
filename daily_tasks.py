@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -10,17 +11,20 @@ from dataclasses import asdict, dataclass
 from maa_adapter import save_image
 from local_vision import RegionOCR, VisionMetrics, VisionOptions, contains, scaled_roi
 from quiz_core import QuizError, normalize
-from quiz_vision import TextBlock, write_json
+from quiz_vision import INPUT_PAUSE_SECONDS, TextBlock, join_blocks, random_click_point, write_json
 
-TOTALS = {"帮派任务": 20, "五环任务": 1, "师门任务": 20, "宝图任务": 15, "卓越竞技场": 3}
+TOTALS = {"帮派任务": 20, "五环任务": 1, "师门任务": 20, "宝图任务": 15, "卓越竞技场": 3, "大理寺答题": 10}
 WAIT_SECONDS = {"帮派任务": 420, "五环任务": 180, "师门任务": 540, "宝图任务": 300}
 PICKUPS = {"帮派任务": ("帮派总管", "帮派任务"),
            "五环任务": ("云游大师", "我自己去拯救苍生！"),
            "师门任务": ("聂小倩", "师门任务"),
-           "宝图任务": ("店小二", "宝图任务")}
+           "宝图任务": ("店小二", "宝图任务"),
+           "大理寺答题": ("大理寺官员", "我要参加有奖问答")}
 TABLE = (250, 58, 462, 282)
 DIALOG = (530, 160, 280, 300)
 TRACKER = (677, 104, 151, 104)
+TASK_INTERVAL_MIN_SECONDS = 10
+DEFAULT_TASK_INTERVAL_MAX_SECONDS = 300
 
 
 def compact(text):
@@ -80,11 +84,23 @@ class DailyView:
         text = self.text((230, 130, 375, 60))
         return "宝图任务已完成" in text and "是否开始挖宝" in text
 
+    @property
+    def broom_guide(self):
+        text = self.text((200, 410, 470, 40))
+        return "用了金扫帚" in text and "日常不用愁" in text
+
     def tracking(self):
-        text = self.text(TRACKER)
-        for name in WAIT_SECONDS:
-            if re.search(re.escape(name[:2]) + r"[^/]{0,35}\d+/\d+", text):
-                return name
+        blocks = self.inside(TRACKER)
+        if not blocks:
+            return None
+        for line in join_blocks(blocks, 0.8).splitlines():
+            text = compact(line)
+            if text.startswith("帮派悬赏"):
+                continue
+            for name in WAIT_SECONDS:
+                match = re.fullmatch(re.escape(name[:2]) + r"[^()/]{0,35}\(([1-9]\d*)/([1-9]\d*)\)", text)
+                if match and int(match[1]) <= int(match[2]):
+                    return name
         return None
 
     def go_button_visible(self, left, top):
@@ -99,10 +115,14 @@ class DailyView:
             raise QuizError("请打开活动 → 日常 → 右下角金扫帚任务列表。")
         cards = []
         for name, total in TOTALS.items():
+            if name == "大理寺答题" and not any(compact(b.text).rstrip("!！") == name for b in self.inside(TABLE)):
+                continue
             title = self.find(name, TABLE)
             left = 250 if title[0] < 480 else 483
             if title[1] + 72 > TABLE[1] + TABLE[3]:
-                raise QuizError(f"{name}卡片未完整显示，不能据此判断完成。")
+                # Completed cards move to the bottom, where the broom panel can hide them.
+                cards.append((title[1], left, Card(name, None, total, "", None)))
+                continue
             roi = (left, title[1] - 4, 229, 76)
             # Restrict the count to its own line, excluding the activity score beneath it.
             match = re.search(r"(\d+)/(\d+)", self.text((left + 53, title[1] + 23, 113, 22)))
@@ -157,11 +177,15 @@ class LocalDailyView(DailyView):
 
 def choose_task(cards, selected):
     pending = [c for c in cards if c.name in selected and not c.done]
-    for name in ("卓越竞技场", "宝图任务"):
+    for name in ("卓越竞技场", "宝图任务", "大理寺答题"):
         for card in pending:
             if card.name == name and card.action == "立即完成":
                 return card
-    return next((c for c in pending if c.name != "卓越竞技场"), None)
+    # shortcut: total activity is not shown here; run five-ring last until a reliable 50-point check is available.
+    for card in pending:
+        if card.name not in ("卓越竞技场", "五环任务"):
+            return card
+    return next((c for c in pending if c.name == "五环任务"), None)
 
 
 class DailyStopped(Exception):
@@ -173,11 +197,16 @@ class DailyTimeout(QuizError):
 
 
 class DailyRunner:
-    def __init__(self, session, runtime_dir, should_stop, on_result=None, *, vision_options=None):
+    def __init__(self, session, runtime_dir, should_stop, on_result=None, *, vision_options=None, answer_quiz=None,
+                 task_interval_max=DEFAULT_TASK_INTERVAL_MAX_SECONDS):
+        if type(task_interval_max) is not int or task_interval_max < TASK_INTERVAL_MIN_SECONDS:
+            raise QuizError(f"日常任务最大间隔必须是至少 {TASK_INTERVAL_MIN_SECONDS} 秒的整数。")
+        self.task_interval_max = task_interval_max
         self.session = session
         self.folder = runtime_dir / "daily"
         self.should_stop = should_stop
         self.on_result = on_result
+        self.answer_quiz = answer_quiz
         self.view = None
         self._preview_at = float("-inf")
         self.options = vision_options or VisionOptions.from_env()
@@ -252,23 +281,33 @@ class DailyRunner:
             time.sleep(min(0.2, max(0, deadline - time.monotonic())))
         self.check_stop()
 
-    def tap(self, view, box):
-        self.check_stop()
+    def _check_tap_view(self, view):
         age = time.monotonic() - view.captured_at
         if age < 0 or age > 10:
             raise QuizError("日常截图已过期，未点击，请重新检查。")
         if getattr(view, "_click_used", False) or (isinstance(view, LocalDailyView) and view.generation != self.reader.generation):
             raise QuizError("当前画面已执行过点击或失效，必须重新截图。")
+
+    def tap(self, view, box, *, urgent=False):
+        self.check_stop()
+        self._check_tap_view(view)
         if box is None or len(box) != 4 or any(not math.isfinite(v) for v in box):
             raise QuizError("无效的点击位置，未点击。")
         x, y, w, h = box
         if min(x, y) < 0 or min(w, h) <= 0 or x + w > 834 or y + h > 470:
             raise QuizError("点击位置超出校准区域，未点击。")
+        left, right = (math.ceil(edge * view.width / 834) for edge in (x, x + w))
+        top, bottom = (math.ceil(edge * view.height / 470) for edge in (y, y + h))
+        if left >= right or top >= bottom:
+            raise QuizError("点击区域没有可用像素，未点击。")
+        if not urgent:
+            self.sleep(random.uniform(*INPUT_PAUSE_SECONDS))
+            self._check_tap_view(view)
+        point = random_click_point((left, top, right - left, bottom - top))
         view._click_used = True
         started = time.perf_counter()
         try:
-            self.session.click(round((x + w / 2) * view.width / 834),
-                               round((y + h / 2) * view.height / 470))
+            self.session.click(*point)
         finally:
             self.metrics.duration("click", started)
             # Also invalidate after a failed/ambiguous input; never retry from this view.
@@ -287,11 +326,17 @@ class DailyRunner:
     def open_list(self):
         view = self.read()
         if view.dig_popup:
-            self.tap(view, view.find("取消", (250, 280, 160, 50)))
+            self.tap(view, view.find("取消", (250, 280, 160, 50)), urgent=True)
             view = self.until(lambda v: not v.dig_popup, "挖宝弹窗尚未关闭。", 10)
         attempts = {"活动": 0, "扫帚": 0}
-        while not view.sweep_panel:
+        while True:
             self.check_stop()
+            if view.broom_guide:
+                self.emit("检测到金扫帚引导，点击关闭后继续日常任务。")
+                self.tap(view, (400, 420, 20, 10))
+                view = self.until(lambda v: not v.broom_guide, "金扫帚引导仍未关闭，已暂停，未重复点击。", 5)
+            if view.sweep_panel:
+                return view
             if view.activity_panel:
                 stage, box = "扫帚", (713, 405, 40, 30)
             else:
@@ -312,12 +357,11 @@ class DailyRunner:
             # shortcut: activity/broom/close icons use this 16:9 layout; recalibrate if the UI moves.
             self.tap(view, box)
             try:
-                view = self.until(lambda v: v.sweep_panel or (stage == "活动" and v.activity_panel),
+                view = self.until(lambda v: v.broom_guide or v.sweep_panel or (stage == "活动" and v.activity_panel),
                                   f"{stage}入口尚未打开。", 5)
             except DailyTimeout:
                 view = self.read()
                 self.emit(f"重新检查{stage}入口，未打开时将再次尝试。")
-        return view
 
     def stable_list(self):
         view = self.open_list()
@@ -325,6 +369,9 @@ class DailyRunner:
         previous = None
         last_error = "任务状态仍在变化。"
         while True:
+            if view.broom_guide:
+                view = self.open_list()
+                previous = None
             try:
                 cards = view.cards()
             except QuizError as exc:
@@ -343,12 +390,21 @@ class DailyRunner:
     def pickup(self, view, card):
         if card.name not in PICKUPS:
             raise QuizError(f"{card.name}没有已接入的普通领取流程。")
+        if card.name == "大理寺答题" and self.answer_quiz is None:
+            raise QuizError("大理寺随机答题处理不可用，未点击领取。")
         self.tap(view, card.button)
         npc, option = PICKUPS[card.name]
         if card.name == "宝图任务":
             npc = "店小"  # The supplied screenshot's OCR omits the final 二.
+        resume_option = "大理寺答题（未完成）"
+
+        def dialog_option(v):
+            if card.name == "大理寺答题" and compact(resume_option) in v.text(DIALOG):
+                return resume_option
+            return option
+
         view = self.until(lambda v: v.tracking() == card.name or
-                          (npc in v.text(DIALOG) and compact(option).rstrip("！!") in v.text(DIALOG)),
+                          (npc in v.text(DIALOG) and compact(dialog_option(v)).rstrip("！!") in v.text(DIALOG)),
                           f"等待{card.name}领取对话超时，未重复领取。")
         if view.tracking() != card.name:
             document_option = "宝图任务（文牒通关）"
@@ -356,17 +412,29 @@ class DailyRunner:
                 self.emit("优先选择宝图任务（文牒通关），随后核对是否直接完成。")
                 self.tap(view, view.find(document_option, DIALOG))
                 return True
-            self.tap(view, view.find(option, DIALOG))
+            self.tap(view, view.find(dialog_option(view), DIALOG))
+            if card.name == "大理寺答题":
+                self.emit("开始大理寺随机答题，不查询题库、不调用 AI。")
+                self.check_stop()
+                try:
+                    result = self.answer_quiz(lambda r: self.emit(
+                        f"大理寺随机答题：已提交 {r['question_number']}/{r['question_total']} 题。"))
+                finally:
+                    self.reader.invalidate()
+                self.check_stop()
+                if result["reason"] == "stopped":
+                    raise DailyStopped()
+                return True
             self.until(lambda v: v.tracking() == card.name, f"未确认{card.name}已开始，未重复领取。", 20)
         return False
 
     def wait_task(self, name):
         estimate = WAIT_SECONDS[name]
-        early_probe = self.options.early_probe and name != "宝图任务"
+        early_probe = self.options.early_probe
         if early_probe:
-            self.emit(f"{name}已开始，最长 {estimate // 60} 分钟后核对次数；期间只读检查完成提示，不操作战斗。")
+            self.emit(f"检测到{name}任务进度，每约 {self.options.probe_seconds:g} 秒截图检查完成提示；最长 {estimate // 60} 分钟后核对次数，不操作战斗。")
         else:
-            self.emit(f"{name}已开始，{estimate // 60} 分钟后首次核对完成状态；停止助手不会停止游戏内自动任务。")
+            self.emit(f"检测到{name}任务进度，{estimate // 60} 分钟后首次核对完成状态；停止助手不会停止游戏内自动任务。")
         deadline = time.monotonic() + estimate
         next_notice = time.monotonic() + 30
         hints = 0
@@ -379,7 +447,7 @@ class DailyRunner:
                 terminal = view.text((60, 320, 650, 80)) if view.tracking() is None else ""
                 positive = "明天再来" in terminal and ("已完成" in terminal or "任务已完成" in terminal)
                 hints = hints + 1 if positive else 0
-                if hints >= 2:
+                if hints >= 2 or (name == "宝图任务" and view.dig_popup):
                     self.emit(f"检测到{name}完成提示，提前核对列表次数。")
                     break
             if time.monotonic() >= next_notice:
@@ -407,12 +475,17 @@ class DailyRunner:
         try:
             view = self.read()
             active = view.tracking()
+            task_completed = False
             if active:
                 if active not in selected:
                     raise QuizError(f"{active}正在执行，请等待完成或勾选该任务后继续。")
                 self.wait_task(active)
+                task_completed = True
             while True:
                 view, cards = self.stable_list()
+                missing = selected - {c.name for c in cards}
+                if missing:
+                    raise QuizError(f"未能识别所选日常「{'、'.join(sorted(missing))}」，已暂停，不能据此判断完成。")
                 pending = [c.name for c in cards if c.name in selected and not c.done]
                 if not pending:
                     self.save()
@@ -422,13 +495,19 @@ class DailyRunner:
                     self.save("竞技场未完成且当前没有可用扫帚，未执行普通竞技场。")
                     return {"reason": "needs_attention", "completed": [c.name for c in cards if c.name in selected and c.done],
                             "pending": pending}
+                if task_completed:
+                    delay = random.uniform(TASK_INTERVAL_MIN_SECONDS, self.task_interval_max)
+                    self.emit(f"上一项日常已完成，随机等待 {delay:.1f} 秒后重新核对并执行下一项。")
+                    self.sleep(delay)
+                    task_completed = False
+                    continue
                 if card.action == "立即完成":
                     self.emit(f"自动使用金扫帚完成{card.name}。")
                     self.tap(view, card.button)
                     # Read immediately: the treasure follow-up has a five-second countdown.
                     view = self.read()
                     if view.dig_popup:
-                        self.tap(view, view.find("取消", (250, 280, 160, 50)))
+                        self.tap(view, view.find("取消", (250, 280, 160, 50)), urgent=True)
                     self.sleep(0.5)
                     _, updated = self.stable_list()
                     if not next(c for c in updated if c.name == card.name).done:
@@ -438,9 +517,11 @@ class DailyRunner:
                         self.sleep(0.5)
                         _, updated = self.stable_list()
                         if not next(c for c in updated if c.name == card.name).done:
-                            raise QuizError("文牒通关后未确认宝图完成，已暂停，未重复使用。")
+                            operation = "随机答题" if card.name == "大理寺答题" else "文牒通关"
+                            raise QuizError(f"{operation}后未确认{card.name}完成，已暂停，未重复执行。")
                     else:
                         self.wait_task(card.name)
+                task_completed = True
         except DailyStopped:
             return {"reason": "stopped"}
         except QuizError as exc:

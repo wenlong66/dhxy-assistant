@@ -114,6 +114,7 @@ class MaaSession:
         self.resource = None
         self.tasker = None
         self.address = ""
+        self.on_frame = None
         config["runtime_dir"].mkdir(parents=True, exist_ok=True)
         # Logs remain local; do not dump screenshots on native recognition errors.
         if not self.api["Toolkit"].init_option(str(config["runtime_dir"]), {
@@ -178,7 +179,10 @@ class MaaSession:
         image = wait_job(self.controller.post_screencap(), self.cfg["timeout_seconds"], "Screenshot").get()
         if image is None or len(image.shape) != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 100:
             raise QuizError("Empty/unsupported screenshot; expected a BGR image.")
-        return image.copy()
+        frame = image.copy()
+        if self.on_frame is not None:
+            self.on_frame(frame)
+        return frame
 
     def guard_scene(self, roi):
         """A real Maa pipeline with OCR + DoNothing; never clicks."""
@@ -212,6 +216,16 @@ class MaaSession:
         if not self.execute:
             raise QuizError("Device input is disabled. An explicit --execute is required.")
         wait_job(self.controller.post_click(int(x), int(y)), self.cfg["timeout_seconds"], "Answer click")
+
+    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: int):
+        if not self.execute:
+            raise QuizError("Device input is disabled. An explicit --execute is required.")
+        if any(type(v) is not int or v < 0 for v in (x1, y1, x2, y2)) or type(duration) is not int or duration <= 0:
+            raise QuizError("Invalid swipe coordinates or duration.")
+        if self.controller is None or not self.controller.connected:
+            raise QuizError("No connected device.")
+        wait_job(self.controller.post_swipe(x1, y1, x2, y2, duration),
+                 self.cfg["timeout_seconds"], "Activity list swipe")
 
     def close(self):
         if self.tasker is not None:

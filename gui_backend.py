@@ -18,8 +18,10 @@ from typing import Any, Callable
 
 from maa_adapter import ROOT, MaaSession, load_config, save_image
 from quiz_core import OpenAIProvider, QuizError, QuizStore
-from quiz_vision import DeviceLock, Layout, QuizReader, ReadError, answer_once, parse_fields, write_json
-from daily_tasks import DailyRunner
+from quiz_vision import DeviceLock, Layout, ReadError, answer_once, write_json
+from daily_tasks import DEFAULT_TASK_INTERVAL_MAX_SECONDS, DailyRunner
+from ring_tasks import RingRunner
+from ring_quiz import UnifiedQuizReader
 
 LOCAL_CONFIG = ROOT / "config/local.json"
 USER_SETTINGS = ("adb_path", "address", "account_scope", "layout")
@@ -172,40 +174,33 @@ class DeviceBackend:
 
     def inspect(self) -> dict:
         session, cfg = self._need_session()
-        layout = Layout.load(cfg["layout"])
-        reader = QuizReader(session, layout, cfg["account_scope"])
-        frame, captured, fields, rois = reader.inspect()
         folder = cfg["runtime_dir"] / "inspection"
-        save_image(frame, folder / "screen.png")
-        save_image(frame, folder / "overlay.png", rois)
-        result = {"fields": {name: [asdict(b) for b in blocks] for name, blocks in fields.items()},
-                  "valid": False, "ai_called": False, "click_sent": False,
-                  "png": preview_png(frame), "width": frame.shape[1], "height": frame.shape[0],
-                  "overlay": str(folder / "overlay.png"), "diagnostics": str(folder)}
+        result = {"valid": False, "ai_called": False, "click_sent": False, "diagnostics": str(folder)}
         try:
-            obs = parse_fields(fields, layout, (frame.shape[1], frame.shape[0]),
-                               session.address, cfg["account_scope"], captured)
-            result.update(valid=True, question={"stem": obs.question.stem,
-                                               "options": dict(obs.question.options)})
+            obs = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"]).read()
+            save_image(obs.frame, folder / "screen.png")
+            save_image(obs.frame, folder / "overlay.png", obs.buttons)
+            result = {**result, "valid": True, "png": preview_png(obs.frame), "width": obs.size[0],
+                      "height": obs.size[1], "overlay": str(folder / "overlay.png"),
+                      "question": {"stem": obs.question.stem, "options": dict(obs.question.options)}}
         except QuizError as exc:
-            result["error"] = str(exc)
-        # Exclude PNG bytes from the diagnostic JSON file.
+            frame = session.capture()
+            result = {**result, "error": str(exc), "png": preview_png(frame)}
         write_json(folder / "ocr.json", {k: v for k, v in result.items() if k != "png"})
         return result
 
     def guard(self) -> dict:
         session, cfg = self._need_session()
-        layout = Layout.load(cfg["layout"])
-        observation = QuizReader(session, layout, cfg["account_scope"]).read()
-        session.guard_scene(layout.scaled(*observation.size)["question"])
-        return {"matched": True, "pipeline": "DaliSceneGuard"}
+        UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"]).read()
+        return {"matched": True, "pipeline": "CalibratedQuizLayout"}
 
     def answer(self, *, use_ai=False, model="", api_key="", execute=False,
                allow_trial=False, layout_confirmed=False, max_daily_calls=30,
                random_answer=False, should_stop: Callable[[], bool] | None = None,
-               expected_view_token=None) -> dict:
+               expected_view_token=None, random_percentage=0) -> dict:
         session, cfg = self._need_session()
-        use_ai = use_ai and not random_answer
+        percentage = 100 if random_answer else random_percentage
+        use_ai = use_ai and percentage is None
         if execute and not layout_confirmed:
             raise QuizError("Inspect and explicitly confirm the screenshot layout before submitting.")
         if use_ai and not model.strip():
@@ -216,10 +211,11 @@ class DeviceBackend:
         store = QuizStore(cfg["database"])
         try:
             provider = OpenAIProvider(model=model, api_key=api_key or None) if use_ai else None
-            reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"], random_answer=random_answer)
+            reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
             return answer_once(reader, session, store, provider=provider, execute=execute,
                                layout_confirmed=layout_confirmed, allow_trial=allow_trial,
                                max_daily_calls=max_daily_calls, random_answer=random_answer,
+                               random_percentage=percentage,
                                receipt_dir=cfg["runtime_dir"] / "receipts",
                                should_stop=should_stop, expected_view_token=expected_view_token)
         finally:
@@ -229,11 +225,10 @@ class DeviceBackend:
     def auto_answer(self, *, should_stop: Callable[[], bool], on_result=None, **options) -> dict:
         session, cfg = self._need_session()
         # The automatic reader validates the scene and layout before authorizing a click.
-        options.update(execute=True, layout_confirmed=True,
-                       use_ai=not options.get("random_answer", False), allow_trial=True)
-        if options["use_ai"] and not options.get("model", "").strip():
-            raise QuizError("自动按题作答需要填写 AI 模型 ID 和 API Key；题库未命中时会调用 AI。")
-        reader = QuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"], random_answer=options.get("random_answer", False))
+        options = {**options, "execute": True, "layout_confirmed": True,
+                   "random_percentage": 100 if options.get("random_answer", False) else options.get("random_percentage", 0),
+                   "use_ai": False}
+        reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
         submitted = last_number = 0
         last_total = last_view = None
         deadline = time.monotonic() + cfg["timeout_seconds"]
@@ -247,7 +242,15 @@ class DeviceBackend:
                 last_error = str(exc)
                 time.sleep(0.5)
                 continue
-            number, total = map(int, re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题", observation.question.stem).groups())
+            match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题", observation.question.stem)
+            if match is None:
+                result = self.answer(should_stop=should_stop, expected_view_token=observation.question.view_token, **options)
+                if not result.get("click_sent"):
+                    raise QuizError("当前题没有可提交答案，答题已暂停。")
+                if on_result is not None:
+                    on_result({**result, "question_number": 1, "question_total": 1})
+                return {"submitted": submitted + 1, "reason": "completed"}
+            number, total = map(int, match.groups())
             if last_number:
                 if total != last_total or number not in (last_number, last_number + 1):
                     raise QuizError("题号跳变或已进入另一轮答题，自动答题已暂停。")
@@ -294,11 +297,35 @@ class DeviceBackend:
         runner.save(result.get("error", ""))
         return result
 
-    def auto_daily(self, *, selected, should_stop, on_result=None) -> dict:
+    def auto_daily(self, *, selected, should_stop, on_result=None,
+                   task_interval_max=DEFAULT_TASK_INTERVAL_MAX_SECONDS, random_percentage=0) -> dict:
         session, cfg = self._need_session()
+        def answer_quiz(progress):
+            result = self.auto_answer(random_percentage=random_percentage, should_stop=should_stop, on_result=progress)
+            session.execute = True
+            return result
         session.execute = True
         try:
-            return DailyRunner(session, cfg["runtime_dir"], should_stop, on_result).run(selected)
+            return DailyRunner(session, cfg["runtime_dir"], should_stop, on_result, answer_quiz=answer_quiz,
+                               task_interval_max=task_interval_max).run(selected)
+        finally:
+            session.execute = False
+
+    def auto_ring(self, *, should_stop, on_result=None, use_ai=False, model="", api_key="",
+                  random_answer=False, allow_trial=False, max_daily_calls=30, random_percentage=0) -> dict:
+        session, cfg = self._need_session()
+
+        def answer_quiz():
+            try:
+                return self.answer(execute=True, layout_confirmed=True, should_stop=should_stop,
+                                   random_answer=random_answer, random_percentage=random_percentage)
+            finally:
+                session.execute = True
+
+        session.execute = True
+        try:
+            return RingRunner(session, cfg["runtime_dir"], should_stop, on_result,
+                              answer_quiz=answer_quiz).run()
         finally:
             session.execute = False
 

@@ -1,0 +1,15 @@
+{
+  "source": "Sanitized actual offline Maa OCR of the user's two-option popup; the empty C area produces a low-confidence dash.",
+  "size": [830, 466],
+  "fields": {
+    "question": [{"text": "吹啊吹啊我的骄傲放纵吹啊吹不毁我", "score": 0.992967, "box": [184, 156, 267, 12]}],
+    "label_A": [{"text": "A", "score": 0.911035, "box": [181, 276, 20, 21]}],
+    "label_B": [{"text": "B", "score": 0.987205, "box": [423, 276, 20, 21]}],
+    "label_C": [{"text": "", "score": 0.0, "box": [181, 335, 20, 22]}],
+    "label_D": [{"text": "-", "score": 0.748021, "box": [423, 335, 20, 22]}],
+    "option_A": [{"text": "小小森林", "score": 0.999549, "box": [204, 275, 63, 19]}],
+    "option_B": [{"text": "纯净花园", "score": 0.997434, "box": [446, 273, 64, 21]}],
+    "option_C": [{"text": "-", "score": 0.178676, "box": [204, 321, 204, 50]}],
+    "option_D": []
+  }
+}

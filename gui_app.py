@@ -10,6 +10,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -26,8 +27,11 @@ except ImportError:
     print("GUI dependency missing. Run: python -m pip install -r requirements-gui.txt", file=sys.stderr)
     raise SystemExit(2)
 
+from daily_tasks import DEFAULT_TASK_INTERVAL_MAX_SECONDS, TASK_INTERVAL_MIN_SECONDS
 from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, local_settings, preview_png, save_local_settings
 from quiz_core import QuizError
+
+PREVIEW_INTERVAL_SECONDS = 10
 
 
 class Bridge(QObject):
@@ -86,8 +90,32 @@ class DeviceWorker:
 
     def _run(self):
         backend = self.backend_factory()
-        last_preview = 0.0
-        import time
+        last_preview = float("-inf")
+        last_frame = None
+
+        def publish_frame(frame):
+            nonlocal last_preview, last_frame
+            if (not self.preview_enabled or not self.alive.is_set()
+                    or self.cancelled.is_set() or frame is last_frame):
+                return
+            try:
+                png = preview_png(frame)
+                self.bridge.message.emit("preview", {"png": png})
+                last_preview = time.monotonic()
+                last_frame = frame
+            except Exception as exc:
+                self.preview_enabled = False
+                self.bridge.message.emit("preview_error", str(exc))
+
+        def refresh_preview():
+            if not self.preview_enabled or not self.alive.is_set() or self.cancelled.is_set():
+                return
+            try:
+                backend.session.capture()
+            except Exception as exc:
+                self.preview_enabled = False
+                self.bridge.message.emit("preview_error", str(exc))
+
         try:
             while True:
                 try:
@@ -95,13 +123,8 @@ class DeviceWorker:
                 except queue.Empty:
                     if (self.alive.is_set() and self.preview_enabled
                             and backend.session is not None and not self.busy
-                            and time.monotonic() - last_preview > 2.0):
-                        last_preview = time.monotonic()
-                        try:
-                            self.bridge.message.emit("preview", backend.capture())
-                        except Exception as exc:
-                            self.preview_enabled = False
-                            self.bridge.message.emit("preview_error", str(exc))
+                            and time.monotonic() - last_preview >= PREVIEW_INTERVAL_SECONDS):
+                        refresh_preview()
                     continue
 
                 if command == "exit":
@@ -128,7 +151,9 @@ class DeviceWorker:
                         result = backend.devices()
                     elif command == "connect":
                         result = backend.connect()
-                        self.preview_enabled = True
+                        backend.session.on_frame = publish_frame
+                        self.preview_enabled = self.alive.is_set() and not self.cancelled.is_set()
+                        refresh_preview()
                     elif command == "capture":
                         result = backend.capture(save=True, overlay=True)
                     elif command == "inspect":
@@ -140,21 +165,20 @@ class DeviceWorker:
                     elif command == "auto_answer":
                         def auto_progress(answer):
                             self.bridge.message.emit("auto_progress", answer)
-                            self.bridge.message.emit("preview", backend.capture())
                         result = backend.auto_answer(
                             should_stop=self.cancelled.is_set,
                             on_result=auto_progress, **args)
                     elif command == "inspect_daily":
                         result = backend.inspect_daily()
-                    elif command == "auto_daily":
+                    elif command in ("auto_daily", "auto_ring"):
                         def daily_progress(progress):
                             # Reuse the runner's fresh frame rather than acquiring another.
                             frame = progress.get("frame")
                             self.bridge.message.emit("daily_progress", {k: v for k, v in progress.items() if k != "frame"})
-                            if frame is not None and self.preview_enabled:
-                                self.bridge.message.emit("preview", {"png": preview_png(frame)})
-                        result = backend.auto_daily(should_stop=self.cancelled.is_set,
-                                                    on_result=daily_progress, **args)
+                            if frame is not None:
+                                publish_frame(frame)
+                        operation = backend.auto_daily if command == "auto_daily" else backend.auto_ring
+                        result = operation(should_stop=self.cancelled.is_set, on_result=daily_progress, **args)
                     elif command == "bank":
                         result = backend.bank(args.get("keyword", ""))
                     elif command == "feedback":
@@ -270,22 +294,33 @@ class MainWindow(QMainWindow):
 
         tasks = QGroupBox("任务选择")
         task_l = QVBoxLayout(tasks)
-        self.dali_check = QCheckBox("大理寺答题（单题／自动；已接入）")
+        self.dali_check = QCheckBox("大理寺答题（日常／单题／自动）")
         self.dali_check.setChecked(True)
+        self.dali_check.setToolTip("日常有扫帚时直接完成，无扫帚时按统一随机比例查库或随机答题；也可单独启动答题。")
         task_l.addWidget(self.dali_check)
-        self.daily_checks = {}
+        self.daily_checks = {"大理寺答题": self.dali_check}
         for name, label in (("师门任务", "师门任务"), ("帮派任务", "帮派任务"),
                             ("宝图任务", "宝图任务"), ("五环任务", "五环任务"),
                             ("卓越竞技场", "卓越竞技场（仅金扫帚）")):
             check = QCheckBox(label)
             check.setChecked(True)
             if name == "宝图任务":
-                check.setToolTip("优先使用已有扫帚；领取时优先文牒通关，否则普通领取后等待 5 分钟再检查。")
+                check.setToolTip("优先使用已有扫帚；领取时优先文牒通关，否则普通领取后默认每约 5 秒检查完成提示。")
             self.daily_checks[name] = check
             task_l.addWidget(check)
-        task_note = QLabel("日常按当前列表顺序；自动用已有金扫帚，优先竞技场、宝图。大理寺单独启动。")
+        task_note = QLabel("扫帚优先竞技场、宝图、大理寺；答题统一按右侧随机比例执行。其余按列表顺序，五环最后尝试；不处理野外封妖。")
         task_note.setWordWrap(True)
         task_l.addWidget(task_note)
+        interval_row = QHBoxLayout()
+        interval_row.addWidget(QLabel("任务最大间隔："))
+        self.daily_interval_max = QSpinBox()
+        self.daily_interval_max.setMaximum(2147483647)  # QSpinBox's signed integer limit.
+        self.daily_interval_max.setMinimum(TASK_INTERVAL_MIN_SECONDS)
+        self.daily_interval_max.setValue(DEFAULT_TASK_INTERVAL_MAX_SECONDS)
+        self.daily_interval_max.setSuffix(" 秒")
+        self.daily_interval_max.setToolTip("完成日常后，随机等待 10 秒至此最大值再执行下一项；最后一项不等待。仅本次打开助手有效。")
+        interval_row.addWidget(self.daily_interval_max)
+        task_l.addLayout(interval_row)
         daily_controls = QHBoxLayout()
         self.daily_inspect_btn = make_button("检查日常列表", lambda: self.run_command("inspect_daily"))
         self.daily_start_btn = make_button("开始日常任务", self.start_daily)
@@ -293,41 +328,38 @@ class MainWindow(QMainWindow):
         daily_controls.addWidget(self.daily_inspect_btn)
         daily_controls.addWidget(self.daily_start_btn)
         task_l.addLayout(daily_controls)
+        self.ring_start_btn = make_button("开始200环", self.start_ring)
+        self.ring_start_btn.setToolTip("独立执行周月常200环：自动找入口、滑动和续环；答题沿用右侧设置，不操作战斗或未知NPC，不自动购买、交物品。")
+        task_l.addWidget(self.ring_start_btn)
         settings_row.addWidget(tasks, 1)
 
         options = QGroupBox("答题控制")
         options_l = QVBoxLayout(options)
-        self.ai_enabled = QCheckBox("题库未命中时询问 OpenAI（可能产生费用）")
-        self.allow_trial = QCheckBox("允许试答尚未验证的 AI 候选")
-        self.random_answer = QCheckBox("随机答题（不查题库、不调用 AI）")
-        self.random_answer.toggled.connect(self.ai_enabled.setDisabled)
-        self.random_answer.toggled.connect(self.allow_trial.setDisabled)
+        self.random_answer = QCheckBox("完全随机答题（忽略题库）")
         self.layout_confirmed = QCheckBox("已核对本设备 OCR、选项位置与区域框图")
-        self.layout_confirmed.setToolTip("仅非随机的单题手动提交需要确认；随机和自动答题会自行识别并校验按钮。")
-        for ch in (self.random_answer, self.ai_enabled, self.allow_trial, self.layout_confirmed):
-            options_l.addWidget(ch)
-        self.model_edit = QLineEdit(os.environ.get("OPENAI_MODEL", ""))
-        self.model_edit.setPlaceholderText("API 模型 ID（仅开启 AI 时需要）")
-        options_l.addWidget(self.model_edit)
-        self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setPlaceholderText("OpenAI API Key（仅当前运行内存使用，不保存）")
-        options_l.addWidget(self.key_edit)
-        max_row = QHBoxLayout()
-        max_row.addWidget(QLabel("每日 AI 请求次数上限："))
-        self.max_calls = QSpinBox()
-        self.max_calls.setRange(1, 1000)
-        self.max_calls.setValue(30)
-        max_row.addWidget(self.max_calls)
-        max_row.addStretch()
-        options_l.addLayout(max_row)
+        self.layout_confirmed.setToolTip("单题手动提交先确认布局；自动答题自行识别并校验按钮。")
+        options_l.addWidget(self.random_answer)
+        ratio_row = QHBoxLayout()
+        ratio_row.addWidget(QLabel("随机比例："))
+        self.random_percentage = QSpinBox()
+        self.random_percentage.setRange(0, 100)
+        self.random_percentage.setValue(0)
+        self.random_percentage.setSuffix("%")
+        self.random_percentage.setToolTip("50表示每题50%概率随机、50%概率查题库；题库未命中也随机，不代表实际答对率。")
+        self.random_answer.toggled.connect(self.random_percentage.setDisabled)
+        ratio_row.addWidget(self.random_percentage)
+        options_l.addLayout(ratio_row)
+        options_l.addWidget(self.layout_confirmed)
+        learning_note = QLabel("2–4个选项共用策略；查库未命中随机。识别到正确对勾后收录正确答案，包含答错后揭示的答案；不调用 AI。")
+        learning_note.setWordWrap(True)
+        options_l.addWidget(learning_note)
         settings_row.addWidget(options, 2)
 
         controls = QHBoxLayout()
         self.preview_btn = make_button("预览本题答案", self.preview_answer)
         self.execute_btn = make_button("提交本题一次", self.execute_answer)
         self.auto_btn = make_button("开始自动答题", self.start_auto_answer)
-        self.auto_btn.setToolTip("勾选随机则连续随机提交；否则题库优先，未命中用 AI 并提交。")
+        self.auto_btn.setToolTip("所有任务共用2–4选项答题策略；按随机比例查库或随机，识别正确对勾后收录答案。")
         self.pause_btn = make_button("暂停画面预览", self.toggle_preview)
         controls.addWidget(self.preview_btn)
         controls.addWidget(self.execute_btn)
@@ -343,7 +375,7 @@ class MainWindow(QMainWindow):
         al.addWidget(self.answer_out)
         left.addWidget(answer_box, stretch=1)
 
-        video_box = QGroupBox("游戏画面（约每 2 秒刷新，仅截图）")
+        video_box = QGroupBox(f"游戏画面（默认 {PREVIEW_INTERVAL_SECONDS} 秒刷新，操作时复用截图）")
         vl = QVBoxLayout(video_box)
         self.preview_label = QLabel("请先扫描并连接 Android 模拟器")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -497,22 +529,16 @@ class MainWindow(QMainWindow):
             self.log("实时画面预览已恢复。")
 
     def answer_params(self, *, execute: bool, automatic=False):
-        if not self.dali_check.isChecked():
-            raise QuizError("没有勾选已实现的大理寺答题模块。")
-        random_answer = self.random_answer.isChecked()
-        if execute and not (automatic or random_answer) and not self.last_inspection_valid:
-            raise QuizError("题目 OCR 尚未通过：请点击「OCR 识别当前题」，到「OCR 调试」查看题号、题干和选项的识别结果。")
-        if execute and not (automatic or random_answer) and not self.layout_confirmed.isChecked():
-            raise QuizError("题目 OCR 已通过，请核对题干、全部选项及区域框图，再勾选布局确认。")
-        use_ai = (automatic or self.ai_enabled.isChecked()) and not random_answer
-        if use_ai and not self.model_edit.text().strip():
-            raise QuizError("按题作答需要填写 OpenAI 模型 ID。")
-        return {"use_ai": use_ai, "model": self.model_edit.text().strip(),
-                "api_key": self.key_edit.text(), "execute": execute,
-                "random_answer": random_answer,
-                "allow_trial": automatic or self.allow_trial.isChecked(),
-                "layout_confirmed": execute and (automatic or random_answer or self.layout_confirmed.isChecked()),
-                "max_daily_calls": self.max_calls.value()}
+        if execute and not (automatic or self.random_answer.isChecked()) and not self.last_inspection_valid:
+            raise QuizError("题目 OCR 尚未通过：请先识别当前题并核对题干和选项。")
+        if execute and not (automatic or self.random_answer.isChecked()) and not self.layout_confirmed.isChecked():
+            raise QuizError("题目 OCR 已通过，请核对选项和区域框图，再勾选布局确认。")
+        return {"execute": execute, "random_percentage": self.quiz_percentage(),
+                "layout_confirmed": execute and (automatic or self.random_answer.isChecked()
+                                                  or self.layout_confirmed.isChecked())}
+
+    def quiz_percentage(self):
+        return 100 if self.random_answer.isChecked() else self.random_percentage.value()
 
     def preview_answer(self):
         try:
@@ -539,11 +565,10 @@ class MainWindow(QMainWindow):
             params = self.answer_params(execute=True, automatic=True)
         except QuizError as exc:
             self.log(str(exc)); return
-        mode = ("连续随机选择答案并提交。" if params["random_answer"] else
-                "题库优先，未命中时调用 AI 并自动提交候选答案，可能产生 API 费用。")
+        mode = (f"每题 {params['random_percentage']}% 概率随机，剩余概率查题库；未命中也随机，不调用 AI。")
         confirmation = QMessageBox.question(
             self, "开始自动答题", mode + "\n\n将从当前题连续答到本轮最后一题。"
-            "程序会自动识别题目并检查布局，答案可能出错，不会自动标记答对。\n点击「断开 / 停止」可中止后续提交。",
+            "程序会自动识别题目并检查布局；看到可靠正确对勾时收录答案，否则不推测对错。\n点击「断开 / 停止」可中止后续提交。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if confirmation == QMessageBox.StandardButton.Yes:
@@ -557,7 +582,11 @@ class MainWindow(QMainWindow):
         if not selected:
             self.log("请先勾选要执行的日常任务。")
             return
-        self.run_command("auto_daily", selected=selected)
+        self.run_command("auto_daily", selected=selected, task_interval_max=self.daily_interval_max.value(),
+                         random_percentage=self.quiz_percentage())
+
+    def start_ring(self):
+        self.run_command("auto_ring", random_percentage=self.quiz_percentage())
 
     def save_feedback(self):
         result = self.outcome_combo.currentData()
@@ -585,17 +614,16 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(not busy and not self.connected)
         self.disconnect_btn.setEnabled(self.connected or busy)
         for btn in (self.preview_btn, self.execute_btn, self.auto_btn, self.inspect_btn, self.guard_btn,
-                    self.screenshot_btn, self.daily_inspect_btn, self.daily_start_btn):
+                    self.screenshot_btn, self.daily_inspect_btn, self.daily_start_btn, self.ring_start_btn):
             btn.setEnabled(self.connected and not busy)
         for check in self.daily_checks.values():
             check.setEnabled(not busy)
+        self.daily_interval_max.setEnabled(not busy)
         self.pause_btn.setEnabled(self.connected)
         self.save_settings_btn.setEnabled(not busy and not self.connected)
         self.random_answer.setEnabled(not busy)
-        self.ai_enabled.setEnabled(not busy and not self.random_answer.isChecked())
-        self.allow_trial.setEnabled(not busy and not self.random_answer.isChecked())
-        for widget in (self.model_edit, self.key_edit, self.max_calls, self.layout_confirmed):
-            widget.setEnabled(not busy)
+        self.random_percentage.setEnabled(not busy and not self.random_answer.isChecked())
+        self.layout_confirmed.setEnabled(not busy)
         for widget in (self.adb_edit, self.addr_edit, self.scope_edit, self.layout_edit):
             widget.setEnabled(not busy and not self.connected)
         self.status.setText("执行中…" if busy else ("已连接" if self.connected else "未连接"))
@@ -609,7 +637,7 @@ class MainWindow(QMainWindow):
             attempt = (payload.get("decision") or {}).get("attempt_id")
             if attempt:
                 self.attempt_edit.setText(attempt)
-            self.log(f"自动答题：已提交第 {payload['question_number']}/{payload['question_total']} 题，结果仍需核实。")
+            self.log(f"自动答题：已提交第 {payload['question_number']}/{payload['question_total']} 题，反馈状态：{payload.get('outcome', '未确认')}。")
             return
         if kind == "preview":
             self.show_frame(payload["png"])
@@ -677,13 +705,14 @@ class MainWindow(QMainWindow):
             decision = result.get("decision") or {}
             if result.get("click_sent") and decision.get("attempt_id"):
                 self.attempt_edit.setText(decision["attempt_id"])
-                self.log("已点击一次；并非已答对。请在题库页按游戏实际反馈记录结果。")
+                self.log("已点击一次；" + ("识别到正确选项，已处理题库记录。" if result.get("outcome") in ("correct", "wrong")
+                                           else "未确认正确选项，可在题库页按实际反馈补录。"))
                 self.tabs.setCurrentIndex(0)
             else:
                 self.log("本题仅完成查询／预览，未点击游戏。")
         elif command == "auto_answer":
             state = "本轮最后一题已提交" if result["reason"] == "completed" else "已停止"
-            self.log(f"自动答题{state}；本次共提交 {result['submitted']} 题，未自动判定对错。")
+            self.log(f"自动答题{state}；本次共提交 {result['submitted']} 题，正确标记的学习结果见逐题回执。")
         elif command == "inspect_daily":
             self.show_frame(result["png"])
             self.answer_out.setPlainText(json.dumps({k: v for k, v in result.items() if k != "png"}, ensure_ascii=False, indent=2))
@@ -694,6 +723,9 @@ class MainWindow(QMainWindow):
             states = {"completed": "所选日常均已核对完成", "stopped": "已停止后续操作",
                       "needs_attention": "竞技场缺少可用金扫帚，仍有未完成项"}
             self.log(states[result["reason"]])
+        elif command == "auto_ring":
+            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+            self.log("200环已停止后续操作。" if result["reason"] == "stopped" else result["message"])
         elif command == "bank":
             self.bank_table.setRowCount(len(result))
             for i, row in enumerate(result):

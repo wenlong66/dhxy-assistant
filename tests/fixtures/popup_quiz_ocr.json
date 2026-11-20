@@ -1,0 +1,15 @@
+{
+  "source": "Sanitized actual offline Maa OCR of the supplied choice-popup screenshot; no answer verification or game input.",
+  "size": [830, 466],
+  "fields": {
+    "question": [{"text": "“一骑红尘妃子笑，无人知是荔枝来。“中的“妃子”是？", "score": 0.971161, "box": [184, 150, 379, 22]}],
+    "label_A": [{"text": "A", "score": 0.911035, "box": [181, 276, 20, 21]}],
+    "label_B": [{"text": "B", "score": 0.987205, "box": [423, 276, 20, 21]}],
+    "label_C": [{"text": "C", "score": 0.95829, "box": [181, 335, 20, 22]}],
+    "label_D": [{"text": "-", "score": 0.748021, "box": [423, 335, 20, 22]}],
+    "option_A": [{"text": "杨贵妃", "score": 0.99766, "box": [204, 275, 51, 19]}],
+    "option_B": [{"text": "欧阳修", "score": 0.999508, "box": [446, 275, 49, 19]}],
+    "option_C": [{"text": "苏轼", "score": 0.998682, "box": [204, 332, 37, 22]}],
+    "option_D": []
+  }
+}

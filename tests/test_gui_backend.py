@@ -141,16 +141,42 @@ class BackendSessionTests(unittest.TestCase):
         self.assertIsNone(answer.call_args.kwargs["provider"])
         self.assertFalse(self.backend.session.execute)
 
-    def test_guard_checks_question_region_instead_of_title(self):
+    def test_daily_dali_reuses_random_quiz_and_restores_input_for_daily_navigation(self):
         self.backend.connect()
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
-            self.backend.session, "guard_scene", create=True
-        ) as guard:
-            reader.return_value.read.return_value.size = (834, 470)
+        progress = MagicMock()
+        stopped = lambda: False
+        def answer(**options):
+            self.backend.session.execute = False
+            return {"reason": "completed", "submitted": 10}
+        with patch.object(gui_backend, "DailyRunner") as runner, \
+                patch.object(self.backend, "auto_answer", side_effect=answer) as auto, \
+                patch.object(gui_backend, "OpenAIProvider") as provider:
+            def run(selected):
+                self.assertEqual(selected, ["大理寺答题"])
+                result = runner.call_args.kwargs["answer_quiz"](progress)
+                self.assertEqual(result, {"reason": "completed", "submitted": 10})
+                self.assertTrue(self.backend.session.execute)
+                return {"reason": "completed", "completed": selected, "pending": []}
+            runner.return_value.run.side_effect = run
+            result = self.backend.auto_daily(selected=["大理寺答题"], should_stop=stopped)
+        self.assertEqual(result["reason"], "completed")
+        auto.assert_called_once_with(random_percentage=0, should_stop=stopped, on_result=progress)
+        provider.assert_not_called()
+        self.assertFalse(self.backend.session.execute)
+
+    def test_daily_task_interval_maximum_is_forwarded_to_runner(self):
+        self.backend.connect()
+        with patch.object(gui_backend, "DailyRunner") as runner:
+            self.backend.auto_daily(selected=["师门任务"], should_stop=lambda: False, task_interval_max=75)
+        self.assertEqual(runner.call_args.kwargs["task_interval_max"], 75)
+        self.assertFalse(self.backend.session.execute)
+
+    def test_guard_uses_the_shared_layout_reader_without_task_title(self):
+        self.backend.connect()
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader:
             result = self.backend.guard()
         self.assertTrue(result["matched"])
         reader.return_value.read.assert_called_once_with()
-        guard.assert_called_once_with((279, 155, 353, 78))
 
     def auto_frame(self, number, total=3):
         question = Question(f"第{number}/{total}题:测试{number}？", (("A", "甲"), ("B", "乙")), f"frame-{number}")
@@ -171,7 +197,7 @@ class BackendSessionTests(unittest.TestCase):
                     store.close()
                     provider.answer.reset_mock()
                 progress = []
-                with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+                with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
                     gui_backend, "OpenAIProvider", return_value=provider
                 ), patch.object(gui_backend, "answer_once", side_effect=lambda *args, **kw: answer_once(
                     *args, sleep=lambda _: None, **kw
@@ -182,7 +208,7 @@ class BackendSessionTests(unittest.TestCase):
                 self.assertEqual(result, {"submitted": 10, "reason": "completed"})
                 self.assertEqual(self.backend.session.click_count, 10)
                 self.assertEqual([r["question_number"] for r in progress], list(range(1, 11)))
-                self.assertEqual(provider.answer.call_count, 0 if random_answer else 9)
+                self.assertEqual(provider.answer.call_count, 0)
                 self.assertFalse(self.backend.session.execute)
                 store = QuizStore(self.cfg["database"])
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM attempts WHERE submitted_at IS NOT NULL").fetchone()[0], 10)
@@ -190,9 +216,23 @@ class BackendSessionTests(unittest.TestCase):
                 store.close()
                 self.backend.disconnect()
 
+    def test_auto_popup_without_question_number_uses_shared_strategy_once(self):
+        self.backend.connect()
+        popup = self.auto_frame(1, 1)
+        popup = Observation(Question("普通任务弹窗题目？", (("A", "甲"), ("B", "乙")), "popup"),
+                            popup.size, popup.buttons, popup.captured_at)
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, \
+                patch.object(self.backend, "answer", return_value={"click_sent": True}) as answer:
+            reader.return_value.read.return_value = popup
+            result = self.backend.auto_answer(random_percentage=50, should_stop=lambda: False)
+        self.assertEqual(result, {"submitted": 1, "reason": "completed"})
+        self.assertEqual(answer.call_args.kwargs["random_percentage"], 50)
+        self.assertFalse(answer.call_args.kwargs["use_ai"])
+        self.assertEqual(answer.call_args.kwargs["expected_view_token"], popup.question.view_token)
+
     def test_auto_tolerates_transient_ocr_failure_before_submitting(self):
         self.backend.connect()
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", return_value={"click_sent": True}
         ) as answer, patch("gui_backend.time.sleep"):
             reader.return_value.read.side_effect = [QuizError("transition"), self.auto_frame(1, 1)]
@@ -212,7 +252,7 @@ class BackendSessionTests(unittest.TestCase):
             return frame
         provider = MagicMock()
         provider.answer.return_value = AIAnswer("answer", "甲", "Offline fixture", "test-model")
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             gui_backend, "OpenAIProvider", return_value=provider
         ), patch.object(gui_backend, "answer_once", side_effect=lambda *args, **kw: answer_once(
             *args, sleep=lambda _: None, **kw
@@ -220,7 +260,7 @@ class BackendSessionTests(unittest.TestCase):
             reader.return_value.read.side_effect = read
             result = self.backend.auto_answer(random_answer=False, model="test-model", should_stop=lambda: False)
         self.assertEqual(result["submitted"], 1)
-        self.assertEqual(provider.answer.call_count, 1)
+        self.assertEqual(provider.answer.call_count, 0)
         self.assertEqual(self.backend.session.click_count, 1)
         self.assertFalse(self.backend.session.execute)
 
@@ -228,7 +268,7 @@ class BackendSessionTests(unittest.TestCase):
         self.backend.connect()
         frames = [self.auto_frame(n) for n in (1, 1, 2, 2, 3)]
         results = []
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", side_effect=lambda **kw: {"click_sent": True}
         ) as answer, patch("gui_backend.time.sleep"):
             reader.return_value.read.side_effect = frames
@@ -241,16 +281,16 @@ class BackendSessionTests(unittest.TestCase):
         self.assertTrue(all(not c.kwargs["use_ai"] for c in answer.call_args_list))
         self.assertEqual(answer.call_args_list[0].kwargs["expected_view_token"], frames[0].question.view_token)
 
-    def test_auto_nonrandom_uses_ai_and_allows_candidate_submission(self):
+    def test_auto_nonrandom_uses_verified_bank_then_random_without_ai(self):
         self.backend.connect()
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", return_value={"click_sent": True}
         ) as answer:
             reader.return_value.read.return_value = self.auto_frame(1, 1)
             self.backend.auto_answer(random_answer=False, model="test-model", layout_confirmed=True,
                                      should_stop=lambda: False)
-        self.assertTrue(answer.call_args.kwargs["use_ai"])
-        self.assertTrue(answer.call_args.kwargs["allow_trial"])
+        self.assertFalse(answer.call_args.kwargs["use_ai"])
+        self.assertEqual(answer.call_args.kwargs["random_percentage"], 0)
         self.assertTrue(answer.call_args.kwargs["execute"])
 
     def test_auto_stop_prevents_next_question_submission(self):
@@ -259,7 +299,7 @@ class BackendSessionTests(unittest.TestCase):
         def on_result(result):
             nonlocal stopped
             stopped = True
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", return_value={"click_sent": True}
         ) as answer:
             reader.return_value.read.return_value = self.auto_frame(1)
@@ -270,14 +310,14 @@ class BackendSessionTests(unittest.TestCase):
 
     def test_auto_stops_on_skipped_question_and_on_no_answer(self):
         self.backend.connect()
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", side_effect=lambda **kw: {"click_sent": True}
         ) as answer:
             reader.return_value.read.side_effect = [self.auto_frame(1), self.auto_frame(3)]
             with self.assertRaisesRegex(QuizError, "题号"):
                 self.backend.auto_answer(random_answer=True, layout_confirmed=True, should_stop=lambda: False)
             self.assertEqual(answer.call_count, 1)
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", return_value={"click_sent": False, "decision": {"status": "needs_review"}}
         ) as answer:
             reader.return_value.read.return_value = self.auto_frame(1)
@@ -288,7 +328,7 @@ class BackendSessionTests(unittest.TestCase):
     def test_auto_times_out_without_repeating_click(self):
         self.backend.connect()
         frame = self.auto_frame(1)
-        with patch.object(gui_backend, "QuizReader") as reader, patch.object(
+        with patch.object(gui_backend, "UnifiedQuizReader") as reader, patch.object(
             self.backend, "answer", return_value={"click_sent": True}
         ) as answer, patch("gui_backend.time.sleep"), patch(
             "gui_backend.time.monotonic", side_effect=[0, 0, 0, 10]

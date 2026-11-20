@@ -21,7 +21,7 @@ class VisionOptions:
     mode: str = "roi"
     poll_seconds: float = 0.20
     cache_seconds: float = 1.0
-    probe_seconds: float = 3.0
+    probe_seconds: float = 5.0
     early_probe: bool = True
 
     def __post_init__(self):
@@ -45,7 +45,7 @@ class VisionOptions:
             return cls(mode=mode,
                        poll_seconds=float(os.environ.get("DHXY_POLL_SECONDS", "0.20")),
                        cache_seconds=float(os.environ.get("DHXY_CACHE_SECONDS", "1.0")),
-                       probe_seconds=float(os.environ.get("DHXY_PROBE_SECONDS", "3.0")),
+                       probe_seconds=float(os.environ.get("DHXY_PROBE_SECONDS", "5.0")),
                        early_probe=early == "1")
         except ValueError as exc:
             raise QuizError(f"Invalid local vision configuration: {exc}") from exc

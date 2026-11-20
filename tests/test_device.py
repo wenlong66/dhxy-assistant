@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from maa_adapter import ROOT, MaaSession, ldplayer_config, load_config, load_maa, select_device, wait_job
 from quiz_core import AIAnswer, QuizError, QuizStore
-from quiz_vision import (DeviceLock, Layout, QuizReader, TextBlock, answer_once, assert_same,
+from quiz_vision import (DeviceLock, Layout, QuizReader, ReadError, TextBlock, answer_once, assert_same,
                          join_blocks, parse_fields)
 from setup_ocr import verify_file, verify_models
 
@@ -85,24 +85,27 @@ class LayoutTests(unittest.TestCase):
         session = NS(capture=lambda: NS(shape=(470, 834, 3)), ocr=ocr, address="test-device")
         self.assertEqual(len(QuizReader(session, self.layout, "test-profile").read().question.options), 4)
 
-    def test_random_reader_only_reads_number_and_existing_button_letters(self):
+    def test_random_reader_keeps_actual_question_and_options_for_learning(self):
         rois = self.layout.scaled(834, 470)
         for count in (2, 3, 4):
             with self.subTest(count=count):
+                data = fields()
+                data["question"] = [TextBlock("第5/10题：实际题干？", .99, (0, 0, 120, 20))]
+                for letter in "ABCD"[count:]:
+                    data[f"label_{letter}"] = []
+                    data[f"option_{letter}"] = []
                 calls = []
                 def ocr(frame, roi, *, single_line=False):
                     calls.append(roi)
-                    if roi[0:2] == rois["question"][0:2]:
-                        return [TextBlock("第5/10题：", .99, (0, 0, 90, 20)),
-                                TextBlock("读不清的题干", .1, (0, 30, 90, 20))]
-                    label = next(k for k in "ABCD" if roi == rois[f"label_{k}"])
-                    return [TextBlock(label if label in "ABCD"[:count] else "-", .99 if label in "ABCD"[:count] else .3, (0, 0, 20, 20))]
+                    return data[next(name for name, rect in rois.items() if rect == roi)]
                 session = NS(capture=lambda: NS(shape=(470, 834, 3)), ocr=ocr, address="test-device")
                 result = QuizReader(session, self.layout, "test-profile", random_answer=True).read()
-                self.assertEqual(dict(result.question.options), {k: f"选项{k}" for k in "ABCD"[:count]})
-                self.assertEqual(set(result.buttons), set("ABCD"[:count]))
-                self.assertEqual(len(calls), 5)
-                self.assertTrue(all(roi not in [rois[f"option_{k}"] for k in "ABCD"] for roi in calls))
+                self.assertEqual(dict(result.question.options), dict(zip("ABCD"[:count], "甲乙丙丁"[:count])))
+                self.assertIn("实际题干", result.question.stem)
+                self.assertEqual(len(calls), 9)
+                data["question"] = [TextBlock("第5/10题：读不清", .1, (0, 0, 120, 20))]
+                with self.assertRaises(ReadError):
+                    QuizReader(session, self.layout, "test-profile", random_answer=True).read()
 
     def test_reject_portrait(self):
         with self.assertRaises(QuizError): self.layout.scaled(720, 1280)
@@ -241,7 +244,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 0)
         self.store.feedback(submitted["decision"]["attempt_id"], "correct", "Test feedback")
-        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+        self.assertEqual(self.store.db.execute("SELECT status FROM answers").fetchone()[0], "verified")
 
     def test_random_still_requires_layout_and_blocks_repeat_clicks(self):
         with self.assertRaises(QuizError):
@@ -330,6 +333,36 @@ class ExecutionTests(unittest.TestCase):
         self.reader.read.side_effect = [first, first, observation(data=data)]
         with self.assertRaises(QuizError): self.run_answer(execute=True, layout_confirmed=True, allow_trial=True)
         self.session.click.assert_not_called()
+
+    def test_changed_question_during_submit_pause_is_blocked(self):
+        data = fields()
+        data["question"] = [TextBlock("第2/10题：等待期间切题？", .99, (0, 0, 90, 20))]
+        pauses = []
+
+        def sleep(seconds):
+            pauses.append(seconds)
+            if self.reader.read.call_count == 3:
+                self.reader.read.side_effect = lambda: observation(data=data)
+
+        with patch("quiz_vision.random.uniform", return_value=0.30), self.assertRaisesRegex(QuizError, "changed"):
+            self.run_answer(execute=True, layout_confirmed=True, allow_trial=True, sleep=sleep)
+        self.assertEqual(pauses[0], .25)
+        self.assertAlmostEqual(sum(pauses[1:]), .30)
+        self.assertTrue(all(pause <= .1 for pause in pauses[1:]))
+        self.session.click.assert_not_called()
+
+    def test_stop_during_submit_pause_does_not_claim_or_click(self):
+        stopped = False
+
+        def sleep(_):
+            nonlocal stopped
+            stopped = self.reader.read.call_count == 3
+
+        with self.assertRaisesRegex(QuizError, "cancelled"):
+            self.run_answer(execute=True, layout_confirmed=True, allow_trial=True,
+                            sleep=sleep, should_stop=lambda: stopped)
+        self.session.click.assert_not_called()
+        self.assertIsNone(self.store.db.execute("SELECT submitted_at FROM attempts").fetchone()[0])
 
     def test_changed_order_after_ai_is_blocked(self):
         first = observation(); data = fields()
@@ -506,10 +539,25 @@ class AdapterTests(unittest.TestCase):
         session.click(10, 20)
         self.ctrl.post_click.assert_called_once_with(10, 20)
 
+    def test_screenshot_callback_reuses_the_validated_copy(self):
+        import numpy as np
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        session = MaaSession(self.cfg, api=self.api).connect()
+        self.ctrl.post_screencap.return_value = NS(done=True, succeeded=True, get=lambda: image)
+        session.on_frame = MagicMock()
+        frame = session.capture()
+        self.assertIsNot(frame, image)
+        self.assertFalse(np.shares_memory(frame, image))
+        session.on_frame.assert_called_once()
+        self.assertIs(session.on_frame.call_args.args[0], frame)
+        self.ctrl.post_screencap.assert_called_once_with()
+
     def test_empty_screenshot_rejected(self):
         session = MaaSession(self.cfg, api=self.api).connect()
+        session.on_frame = MagicMock()
         self.ctrl.post_screencap.return_value = self.job
         with self.assertRaises(QuizError): session.capture()
+        session.on_frame.assert_not_called()
 
     def test_failed_job_rejected(self):
         with self.assertRaises(QuizError): wait_job(NS(done=True, succeeded=False), 1, "mock")
