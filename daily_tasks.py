@@ -24,7 +24,9 @@ TABLE = (250, 58, 462, 282)
 DIALOG = (530, 160, 280, 300)
 TRACKER = (677, 104, 151, 104)
 TASK_INTERVAL_MIN_SECONDS = 10
-DEFAULT_TASK_INTERVAL_MAX_SECONDS = 300
+DEFAULT_TASK_INTERVAL_MAX_SECONDS = 180
+REWARD_INTERVAL_SECONDS = (8, 15)
+DALI_PRIORITY_MAX_PENDING = 3
 
 
 def compact(text):
@@ -89,6 +91,17 @@ class DailyView:
         text = self.text((200, 410, 470, 40))
         return "用了金扫帚" in text and "日常不用愁" in text
 
+    def five_ring_available(self):
+        if self.sweep_panel or not self.activity_panel:
+            raise QuizError("请打开普通活动日常页核对活跃度。")
+        if "活跃度" not in self.text((250, 370, 55, 30)) or "50" not in self.text((355, 410, 40, 25)):
+            raise QuizError("未确认活跃度条及 50 刻度，未领取五环。")
+        # shortcut: the calibrated 50-point segment is fixed; recalibrate after a layout change.
+        x, y, w, h = scaled_roi((375, 416, 8, 8), self.width, self.height)
+        pixels = self.frame[y:y+h, x:x+w].astype(float)
+        blue, green, red = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
+        return bool(((green > 120) & (green > red * 1.15) & (blue > red * 1.1)).mean() > 0.35)
+
     def tracking(self):
         blocks = self.inside(TRACKER)
         if not blocks:
@@ -129,10 +142,14 @@ class DailyView:
             current = int(match[1]) if match and int(match[2]) == total and 0 <= int(match[1]) <= total else None
             # OCR on the supplied screenshots consistently reads 前往 as 前注.
             buttons = [b for b in self.inside(roi) if compact(b.text) in ("前往", "前注", "立即完成", "一键完成")]
+            button = buttons[0] if len(buttons) == 1 else None
+            is_sweep = button is not None and compact(button.text) in ("立即完成", "一键完成")
+            if name == "卓越竞技场" and not is_sweep:
+                cards.append((title[1], left, Card(name, current, total, "仅金扫帚", None)))
+                continue
             if len(buttons) > 1 or (not buttons and self.go_button_visible(left, title[1])):
                 raise QuizError(f"{name}的领取/扫帚按钮无法确认，已暂停。")
-            button = buttons[0] if len(buttons) == 1 else None
-            action = ("立即完成" if compact(button.text) in ("立即完成", "一键完成") else "前往") if button else ""
+            action = "立即完成" if is_sweep else "前往" if button else ""
             cards.append((title[1], left, Card(name, current, total, action, button.box if button else None)))
         return [c for _, _, c in sorted(cards, key=lambda item: (round(item[0] / 40), item[1]))]
 
@@ -175,17 +192,18 @@ class LocalDailyView(DailyView):
                 and y <= b.box[1] + b.box[3] / 2 < y + h]
 
 
-def choose_task(cards, selected):
+def choose_task(cards, selected, *, five_ring_ready=True):
     pending = [c for c in cards if c.name in selected and not c.done]
+    if len(pending) <= DALI_PRIORITY_MAX_PENDING:
+        dali = next((c for c in pending if c.name == "大理寺答题"), None)
+        if dali is not None:
+            return dali
     for name in ("卓越竞技场", "宝图任务", "大理寺答题"):
         for card in pending:
             if card.name == name and card.action == "立即完成":
                 return card
-    # shortcut: total activity is not shown here; run five-ring last until a reliable 50-point check is available.
-    for card in pending:
-        if card.name not in ("卓越竞技场", "五环任务"):
-            return card
-    return next((c for c in pending if c.name == "五环任务"), None)
+    normal = [c for c in pending if c.name != "卓越竞技场"]
+    return next((c for c in normal if five_ring_ready or c.name != "五环任务"), normal[0] if normal else None)
 
 
 class DailyStopped(Exception):
@@ -207,6 +225,7 @@ class DailyRunner:
         self.should_stop = should_stop
         self.on_result = on_result
         self.answer_quiz = answer_quiz
+        self.five_ring_ready = None
         self.view = None
         self._preview_at = float("-inf")
         self.options = vision_options or VisionOptions.from_env()
@@ -338,6 +357,11 @@ class DailyRunner:
             if view.sweep_panel:
                 return view
             if view.activity_panel:
+                if ("活跃度" in view.text((250, 370, 55, 30))
+                        and "50" in view.text((355, 410, 40, 25))):
+                    self.five_ring_ready = view.five_ring_available()
+                else:
+                    self.five_ring_ready = None
                 stage, box = "扫帚", (713, 405, 40, 30)
             else:
                 finished = [b for b in view.inside((60, 320, 650, 80)) if "明天再来" in compact(b.text)]
@@ -391,7 +415,7 @@ class DailyRunner:
         if card.name not in PICKUPS:
             raise QuizError(f"{card.name}没有已接入的普通领取流程。")
         if card.name == "大理寺答题" and self.answer_quiz is None:
-            raise QuizError("大理寺随机答题处理不可用，未点击领取。")
+            raise QuizError("大理寺答题处理不可用，未点击领取。")
         self.tap(view, card.button)
         npc, option = PICKUPS[card.name]
         if card.name == "宝图任务":
@@ -414,11 +438,11 @@ class DailyRunner:
                 return True
             self.tap(view, view.find(dialog_option(view), DIALOG))
             if card.name == "大理寺答题":
-                self.emit("开始大理寺随机答题，不查询题库、不调用 AI。")
+                self.emit("开始大理寺答题，按统一答题设置选择答案。")
                 self.check_stop()
                 try:
                     result = self.answer_quiz(lambda r: self.emit(
-                        f"大理寺随机答题：已提交 {r['question_number']}/{r['question_total']} 题。"))
+                        f"大理寺答题：已提交 {r['question_number']}/{r['question_total']} 题。"))
                 finally:
                     self.reader.invalidate()
                 self.check_stop()
@@ -475,12 +499,12 @@ class DailyRunner:
         try:
             view = self.read()
             active = view.tracking()
-            task_completed = False
+            completed_interval = None
             if active:
                 if active not in selected:
                     raise QuizError(f"{active}正在执行，请等待完成或勾选该任务后继续。")
                 self.wait_task(active)
-                task_completed = True
+                completed_interval = (TASK_INTERVAL_MIN_SECONDS, self.task_interval_max)
             while True:
                 view, cards = self.stable_list()
                 missing = selected - {c.name for c in cards}
@@ -490,16 +514,16 @@ class DailyRunner:
                 if not pending:
                     self.save()
                     return {"reason": "completed", "completed": [c.name for c in cards if c.name in selected], "pending": []}
-                card = choose_task(cards, selected)
+                card = choose_task(cards, selected, five_ring_ready=self.five_ring_ready is True)
                 if card is None:
-                    self.save("竞技场未完成且当前没有可用扫帚，未执行普通竞技场。")
+                    self.save("竞技场缺少可用扫帚，未执行普通竞技场。")
                     return {"reason": "needs_attention", "completed": [c.name for c in cards if c.name in selected and c.done],
                             "pending": pending}
-                if task_completed:
-                    delay = random.uniform(TASK_INTERVAL_MIN_SECONDS, self.task_interval_max)
+                if completed_interval is not None:
+                    delay = random.uniform(*completed_interval)
                     self.emit(f"上一项日常已完成，随机等待 {delay:.1f} 秒后重新核对并执行下一项。")
                     self.sleep(delay)
-                    task_completed = False
+                    completed_interval = None
                     continue
                 if card.action == "立即完成":
                     self.emit(f"自动使用金扫帚完成{card.name}。")
@@ -517,11 +541,12 @@ class DailyRunner:
                         self.sleep(0.5)
                         _, updated = self.stable_list()
                         if not next(c for c in updated if c.name == card.name).done:
-                            operation = "随机答题" if card.name == "大理寺答题" else "文牒通关"
+                            operation = "答题" if card.name == "大理寺答题" else "文牒通关"
                             raise QuizError(f"{operation}后未确认{card.name}完成，已暂停，未重复执行。")
                     else:
                         self.wait_task(card.name)
-                task_completed = True
+                completed_interval = (REWARD_INTERVAL_SECONDS if card.action == "立即完成" or card.name == "大理寺答题"
+                                      else (TASK_INTERVAL_MIN_SECONDS, self.task_interval_max))
         except DailyStopped:
             return {"reason": "stopped"}
         except QuizError as exc:

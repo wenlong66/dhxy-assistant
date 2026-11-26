@@ -32,6 +32,19 @@ class SettingsAndBankTests(unittest.TestCase):
             self.assertNotIn("api_key", saved)
             self.assertEqual(gui_backend.local_settings()["account_scope"], data["account_scope"])
 
+    def test_ai_local_config_missing_valid_and_invalid(self):
+        target = self.base / "ai.local.json"
+        with patch.object(gui_backend, "LOCAL_AI_CONFIG", target):
+            self.assertEqual(gui_backend.ai_settings(), {"model": "", "api_key": ""})
+            target.write_text(json.dumps({"model": " test-model ", "api_key": " test-key "}), encoding="utf-8-sig")
+            self.assertEqual(gui_backend.ai_settings(), {"model": "test-model", "api_key": "test-key"})
+            for content in ("{", "[]", '{"model": "test-model"}', '{"model": "", "api_key": "secret"}',
+                            '{"model": 1, "api_key": "secret"}'):
+                target.write_text(content, encoding="utf-8")
+                with self.subTest(content=content), self.assertRaises(QuizError) as error:
+                    gui_backend.ai_settings()
+                self.assertNotIn("secret", str(error.exception))
+
     def test_config_unknown_key_cannot_be_saved(self):
         target = self.base / "local.json"
         with patch.object(gui_backend, "LOCAL_CONFIG", target):
@@ -160,7 +173,8 @@ class BackendSessionTests(unittest.TestCase):
             runner.return_value.run.side_effect = run
             result = self.backend.auto_daily(selected=["大理寺答题"], should_stop=stopped)
         self.assertEqual(result["reason"], "completed")
-        auto.assert_called_once_with(random_percentage=0, should_stop=stopped, on_result=progress)
+        auto.assert_called_once_with(random_percentage=0, use_ai=False, model="", api_key="",
+                                     max_daily_calls=30, allow_trial=False, should_stop=stopped, on_result=progress)
         provider.assert_not_called()
         self.assertFalse(self.backend.session.execute)
 
@@ -170,6 +184,23 @@ class BackendSessionTests(unittest.TestCase):
             self.backend.auto_daily(selected=["师门任务"], should_stop=lambda: False, task_interval_max=75)
         self.assertEqual(runner.call_args.kwargs["task_interval_max"], 75)
         self.assertFalse(self.backend.session.execute)
+
+    def test_mixed_ai_options_reach_provider_and_daily_quiz(self):
+        self.backend.connect()
+        with patch.object(gui_backend, "OpenAIProvider") as provider, \
+                patch.object(gui_backend, "answer_once", return_value={"click_sent": False}) as answer:
+            self.backend.answer(use_ai=True, model="test-model", api_key="test-key",
+                                random_percentage=40, allow_trial=True)
+        provider.assert_called_once_with(model="test-model", api_key="test-key")
+        self.assertEqual(answer.call_args.kwargs["random_percentage"], 40)
+        with patch.object(gui_backend, "DailyRunner") as runner, \
+                patch.object(self.backend, "auto_answer", return_value={"reason": "completed"}) as auto:
+            runner.return_value.run.side_effect = lambda _: runner.call_args.kwargs["answer_quiz"](None)
+            self.backend.auto_daily(selected=["大理寺答题"], should_stop=lambda: False,
+                                    random_percentage=40, use_ai=True, model="test-model", api_key="test-key")
+        self.assertTrue(auto.call_args.kwargs["use_ai"])
+        self.assertEqual(auto.call_args.kwargs["random_percentage"], 40)
+        self.assertEqual(auto.call_args.kwargs["api_key"], "test-key")
 
     def test_guard_uses_the_shared_layout_reader_without_task_title(self):
         self.backend.connect()
@@ -258,9 +289,10 @@ class BackendSessionTests(unittest.TestCase):
             *args, sleep=lambda _: None, **kw
         )), patch("gui_backend.time.sleep"):
             reader.return_value.read.side_effect = read
-            result = self.backend.auto_answer(random_answer=False, model="test-model", should_stop=lambda: False)
+            result = self.backend.auto_answer(random_answer=False, use_ai=True, allow_trial=True,
+                                              model="test-model", should_stop=lambda: False)
         self.assertEqual(result["submitted"], 1)
-        self.assertEqual(provider.answer.call_count, 0)
+        self.assertEqual(provider.answer.call_count, 1)
         self.assertEqual(self.backend.session.click_count, 1)
         self.assertFalse(self.backend.session.execute)
 

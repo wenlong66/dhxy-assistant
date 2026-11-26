@@ -31,5 +31,9 @@ publication-result.json
 # Local device config, screenshots and downloaded third-party model weights
 config/local.json
 config/*.local.json
+config/ai.local.json.*
 assets/resource/model/ocr/
 *.device.lock
+# Windows portable build outputs
+/build/
+/dist/

@@ -66,7 +66,7 @@ class DailyParsingTests(unittest.TestCase):
 
     def test_real_ocr_priority_reordering_and_new_broom(self):
         expected = {"initial": "卓越竞技场", "after_arena": "帮派任务",
-                    "after_guild": "师门任务", "new_broom": "宝图任务", "finished": None}
+                    "after_guild": "五环任务", "new_broom": "宝图任务", "finished": None}
         for name, task in expected.items():
             for scale in (1, 2):
                 with self.subTest(frame=name, scale=scale):
@@ -81,28 +81,65 @@ class DailyParsingTests(unittest.TestCase):
                 self.assertEqual((dali.current, dali.total, dali.action), (0, 10, "前往"))
                 self.assertEqual(choose_task(cards, {"大理寺答题"}), dali)
 
-    def test_daily_dali_sweep_follows_arena_and_treasure_but_precedes_normal_pickup(self):
+    def test_daily_dali_sweep_priority_changes_at_three_remaining_tasks(self):
         cards = [Card("帮派任务", 0, 20, "前往", (0, 0, 1, 1)),
                  Card("大理寺答题", 0, 10, "立即完成", (0, 0, 1, 1)),
                  Card("宝图任务", 0, 15, "立即完成", (0, 0, 1, 1)),
                  Card("卓越竞技场", 0, 3, "立即完成", (0, 0, 1, 1))]
         self.assertEqual(choose_task(cards, set(TOTALS)).name, "卓越竞技场")
-        self.assertEqual(choose_task(cards, {"帮派任务", "宝图任务", "大理寺答题"}).name, "宝图任务")
+        self.assertEqual(choose_task(cards, {"帮派任务", "宝图任务", "大理寺答题"}).name, "大理寺答题")
         self.assertEqual(choose_task(cards, {"帮派任务", "大理寺答题"}).name, "大理寺答题")
+
+    def test_dali_is_first_with_up_to_three_pending_selected_tasks(self):
+        others = [Card("卓越竞技场", 0, 3, "立即完成", (0, 0, 1, 1)),
+                  Card("宝图任务", 0, 15, "立即完成", (0, 0, 1, 1)),
+                  Card("帮派任务", 0, 20, "前往", (0, 0, 1, 1))]
+        for action in ("前往", "立即完成"):
+            dali = Card("大理寺答题", 0, 10, action, (0, 0, 1, 1))
+            for remaining in (1, 2, 3, 4):
+                with self.subTest(action=action, remaining=remaining):
+                    cards = [*others[:remaining - 1], dali]
+                    selected = {c.name for c in cards}
+                    expected = dali if remaining <= 3 else others[0]
+                    self.assertEqual(choose_task(cards, selected), expected)
+
+    def test_dali_priority_does_not_count_completed_or_unselected_tasks(self):
+        cards = [Card("帮派任务", 20, 20, "", None),
+                 Card("师门任务", 0, 20, "前往", (0, 0, 1, 1)),
+                 Card("五环任务", 0, 1, "前往", (0, 0, 1, 1)),
+                 Card("宝图任务", 0, 15, "立即完成", (0, 0, 1, 1)),
+                 Card("大理寺答题", 0, 10, "前往", (0, 0, 1, 1))]
+        selected = set(TOTALS) - {"师门任务"}
+        self.assertEqual(choose_task(cards, selected).name, "大理寺答题")
+        self.assertEqual(choose_task(cards, selected - {"大理寺答题"}).name, "宝图任务")
+        completed_dali = [*cards[:-1], Card("大理寺答题", 10, 10, "前往", (0, 0, 1, 1))]
+        self.assertEqual(choose_task(completed_dali, selected).name, "宝图任务")
 
     def test_completed_arena_with_go_button_is_skipped(self):
         arena = next(c for c in view("finished").cards() if c.name == "卓越竞技场")
         self.assertTrue(arena.done)
-        self.assertIsNotNone(arena.button)
+        self.assertIsNone(arena.button)
         self.assertIsNone(choose_task(view("finished").cards(), {"卓越竞技场"}))
+
+    def test_arena_without_a_unique_sweep_button_has_no_click_target(self):
+        for texts in ((), ("前往",), ("前往", "立即完成")):
+            with self.subTest(texts=texts):
+                current = view("finished")
+                button = (424, 98, 43, 22)
+                current.blocks = [TextBlock("日次数：0/3", b.score, b.box) if b.text == "日次数：3/3" else b
+                                  for b in current.blocks if b.box != button]
+                current.blocks = [*current.blocks, *(TextBlock(text, .99, button) for text in texts)]
+                arena = next(c for c in current.cards() if c.name == "卓越竞技场")
+                self.assertEqual(arena, Card("卓越竞技场", 0, 3, "仅金扫帚", None))
+                self.assertFalse(arena.done)
 
     def test_unselected_tasks_are_never_chosen(self):
         self.assertEqual(choose_task(view("initial").cards(), {"五环任务"}).name, "五环任务")
 
-    def test_five_ring_follows_other_selected_tasks(self):
+    def test_five_ring_keeps_current_list_priority(self):
         cards = view("after_guild").cards()
-        self.assertEqual(choose_task(cards, set(TOTALS)).name, "师门任务")
-        self.assertEqual(choose_task(cards, {"五环任务", "宝图任务"}).name, "宝图任务")
+        self.assertEqual(choose_task(cards, set(TOTALS)).name, "五环任务")
+        self.assertEqual(choose_task(cards, {"五环任务", "宝图任务"}).name, "五环任务")
         self.assertEqual(choose_task(cards, {"五环任务", "卓越竞技场"}).name, "五环任务")
 
     def test_field_demon_card_is_not_an_automatic_task(self):
@@ -156,7 +193,7 @@ class DailyParsingTests(unittest.TestCase):
                 self.assertTrue(guild.done)
                 self.assertIsNone(guild.current)
                 self.assertEqual(choose_task(cards, set(TOTALS)).name, "卓越竞技场")
-                self.assertEqual(choose_task(cards, {"帮派任务", "师门任务", "五环任务"}).name, "师门任务")
+                self.assertEqual(choose_task(cards, {"帮派任务", "师门任务", "五环任务"}).name, "五环任务")
 
     def test_real_dialogs_progress_and_popup(self):
         for name, frame in (("帮派任务", "guild_dialog"), ("五环任务", "five_dialog"), ("师门任务", "school_dialog")):
@@ -319,6 +356,105 @@ class DailyRunnerTests(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
+    def test_dali_becomes_first_at_three_pending_tasks_without_counting_five_ring_as_done(self):
+        tasks = ("五环任务", "帮派任务", "师门任务", "大理寺答题")
+        for ready in (False, True):
+            with self.subTest(five_ring_ready=ready):
+                completed = ()
+                self.runner.five_ring_ready = ready
+
+                def stable():
+                    cards = [Card(name, TOTALS[name] if name in completed else 0, TOTALS[name],
+                                  "" if name in completed else "前往", (420, 100, 40, 20)) for name in tasks]
+                    return view("finished"), cards
+
+                def pickup(current, card):
+                    nonlocal completed
+                    completed = (*completed, card.name)
+                    return True
+
+                with patch.object(self.runner, "read", return_value=view("finished")), \
+                        patch.object(self.runner, "stable_list", side_effect=stable), \
+                        patch.object(self.runner, "pickup", side_effect=pickup):
+                    result = self.runner.run(tasks)
+                self.assertEqual(result["reason"], "completed")
+                expected = (("五环任务", "大理寺答题", "帮派任务", "师门任务") if ready else
+                            ("帮派任务", "大理寺答题", "师门任务", "五环任务"))
+                self.assertEqual(completed, expected)
+
+    def test_five_ring_rechecked_after_other_task_then_runs_before_remaining_tasks(self):
+        completed, pickups = [], []
+        initial = view("initial")
+        def stable():
+            self.runner.five_ring_ready = bool(completed)
+            cards = [Card(name, TOTALS[name] if name in completed else 0, TOTALS[name],
+                          "" if name in completed else "前往", (420, 100, 40, 20))
+                     for name in ("五环任务", "帮派任务", "师门任务")]
+            return view("initial"), cards
+        def pickup(current, card):
+            nonlocal completed, pickups
+            pickups = [*pickups, card.name]
+            completed = [*completed, card.name]
+            return True
+        with patch.object(self.runner, "read", return_value=initial), \
+                patch.object(self.runner, "stable_list", side_effect=stable), \
+                patch.object(self.runner, "pickup", side_effect=pickup):
+            result = self.runner.run(["五环任务", "帮派任务", "师门任务"])
+        self.assertEqual(result["reason"], "completed")
+        self.assertEqual(pickups, ["帮派任务", "五环任务", "师门任务"])
+
+    def test_only_five_ring_remaining_runs_without_extra_activity_check(self):
+        self.runner.five_ring_ready = False
+        with patch.object(self.runner, "pickup", wraps=self.runner.pickup) as pickup:
+            result = self.runner.run(["五环任务"])
+        self.assertEqual(result["reason"], "completed")
+        pickup.assert_called_once()
+        self.assertFalse(any(scene == "list" and y > 430 for scene, x, y in self.session.clicks))
+
+    def test_arena_without_broom_does_not_block_last_five_ring(self):
+        self.session.list_name = "five_ready"
+        original = self.session.current_view
+
+        def current_view():
+            current = original()
+            current.blocks = [TextBlock("日次数：0/3", b.score, b.box) if b.text == "日次数：3/3" else b
+                              for b in current.blocks]
+            return current
+
+        with patch.object(self.session, "current_view", side_effect=current_view):
+            result = self.runner.run(["卓越竞技场", "五环任务"])
+        self.assertEqual(result["completed"], ["五环任务"])
+        self.assertEqual(result["pending"], ["卓越竞技场"])
+        assert_clicks_in_boxes(self, [(x, y) for scene, x, y in self.session.clicks if scene == "list"],
+                               (420, 180, 46, 18))
+
+    def test_activity_bar_threshold_scales_and_requires_activity_page(self):
+        for scale in (1, 2):
+            for ready in (True, False):
+                with self.subTest(scale=scale, ready=ready):
+                    current = view("weekly_activity", scale)
+                    current.blocks = [*current.blocks, TextBlock("活跃度", .99, (251, 377, 45, 18)),
+                                      TextBlock("50", .99, (365, 414, 18, 16))]
+                    current.frame[416*scale:424*scale, 375*scale:383*scale] = (151, 177, 50) if ready else (115, 139, 171)
+                    self.assertEqual(current.five_ring_available(), ready)
+        with self.assertRaisesRegex(QuizError, "50 刻度"):
+            view("weekly_activity").five_ring_available()
+        with self.assertRaisesRegex(QuizError, "普通活动"):
+            view("initial").five_ring_available()
+
+    def test_activity_checked_during_broom_entry_without_extra_return(self):
+        activity = view("weekly_activity")
+        activity.blocks = [*activity.blocks, TextBlock("活跃度", .99, (251, 377, 45, 18)),
+                           TextBlock("50", .99, (365, 414, 18, 16))]
+        activity.frame[416:424, 375:383] = (151, 177, 50)
+        sweep = view("initial")
+        with patch.object(self.runner, "read", side_effect=[activity, sweep]), \
+                patch.object(self.session, "click") as click:
+            self.assertIs(self.runner.open_list(), sweep)
+        self.assertTrue(self.runner.five_ring_ready)
+        assert_clicks_in_boxes(self, [click.call_args.args], (713, 405, 40, 30))
+        click.assert_called_once()
+
     def test_full_screenshot_flow_new_broom_popup_and_completion(self):
         with patch.object(self.runner, "pickup", wraps=self.runner.pickup) as pickup:
             result = self.runner.run(LEGACY_TASKS)
@@ -331,17 +467,21 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(sum(scene == "dig_popup" for scene, _, _ in self.session.clicks), 1)
 
     def test_task_interval_varies_between_completed_tasks_and_refreshes_click_views(self):
-        delays = iter((10, 300, 10, 300))
+        delays = iter((10, 180))
+        reward_delays = iter((8, 15))
         def random_delay(low, high):
-            return next(delays) if (low, high) == (10, 300) else 0.25
+            if (low, high) == (8, 15):
+                return next(reward_delays)
+            return next(delays) if (low, high) == (10, 180) else 0.25
         with patch("daily_tasks.random.uniform", side_effect=random_delay) as uniform, \
                 patch.object(self.runner, "sleep", wraps=self.runner.sleep) as sleep:
             result = self.runner.run(LEGACY_TASKS)
         self.assertEqual(result["reason"], "completed")
-        self.assertEqual([call.args[0] for call in sleep.call_args_list if call.args[0] >= 10], [10, 300, 10, 300])
-        self.assertEqual(sum(call.args == (10, 300) for call in uniform.call_args_list), 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list if call.args[0] >= 8], [8, 10, 180, 15])
+        self.assertEqual(sum(call.args == (10, 180) for call in uniform.call_args_list), 2)
+        self.assertEqual(sum(call.args == (8, 15) for call in uniform.call_args_list), 2)
 
-    def test_task_interval_after_document_or_random_quiz_completion(self):
+    def test_document_keeps_long_interval_and_quiz_uses_reward_interval(self):
         for name in ("宝图任务", "大理寺答题"):
             with self.subTest(name=name):
                 runner = DailyRunner(self.session, Path(self.tmp.name), lambda: False, task_interval_max=18)
@@ -362,7 +502,8 @@ class DailyRunnerTests(unittest.TestCase):
                         patch.object(runner, "sleep", wraps=runner.sleep) as sleep:
                     result = runner.run([name, "师门任务"])
                 self.assertEqual(result["reason"], "completed")
-                uniform.assert_called_once_with(10, 18)
+                expected = (10, 18) if name == "宝图任务" else (8, 15)
+                uniform.assert_called_once_with(*expected)
                 self.assertIn(unittest.mock.call(15), sleep.call_args_list)
                 self.assertEqual(stable.call_count, 6)
 
@@ -379,6 +520,25 @@ class DailyRunnerTests(unittest.TestCase):
                 patch("daily_tasks.random.uniform", side_effect=lambda low, high: 10 if low == 10 else 0.25):
             result = self.runner.run(LEGACY_TASKS)
         self.assertEqual(result["reason"], "stopped")
+        self.assertEqual([scene for scene, _, _ in self.session.clicks],
+                         ["list", "list", "dialog", "end", "five_end", "activity"])
+        self.assertEqual(self.session.active, "guild")
+
+    def test_stop_during_reward_interval_prevents_next_task(self):
+        deadline = []
+        self.runner.should_stop = lambda: bool(deadline) and self.clock.now >= deadline[0]
+        original_sleep = self.runner.sleep
+        def sleep(seconds):
+            nonlocal deadline
+            if seconds == 8:
+                deadline = [self.clock.now + 1]
+            original_sleep(seconds)
+        def delay(low, high):
+            return 8 if (low, high) == (8, 15) else 0.25
+        with patch.object(self.runner, "sleep", side_effect=sleep), \
+                patch("daily_tasks.random.uniform", side_effect=delay):
+            result = self.runner.run(LEGACY_TASKS)
+        self.assertEqual(result["reason"], "stopped")
         self.assertEqual([scene for scene, _, _ in self.session.clicks], ["list"])
         self.assertEqual(self.session.list_name, "after_arena")
 
@@ -393,7 +553,7 @@ class DailyRunnerTests(unittest.TestCase):
             result = self.runner.run(["帮派任务", "师门任务"])
         self.assertEqual(result["reason"], "completed")
         wait.assert_called_once_with("帮派任务")
-        uniform.assert_called_once_with(10, 300)
+        uniform.assert_called_once_with(10, 180)
         self.assertAlmostEqual(self.clock.now, 10, delta=0.002)
         tap.assert_not_called()
 
@@ -724,7 +884,7 @@ class DailyRunnerTests(unittest.TestCase):
                 patch.object(self.runner, "stable_list", return_value=(initial, initial.cards())), \
                 patch.object(self.runner, "until", return_value=dialog), patch.object(self.runner, "tap") as tap, \
                 patch.object(self.runner, "answer_quiz", return_value={"reason": "completed", "submitted": 10}) as quiz:
-            with self.assertRaisesRegex(QuizError, "随机答题后未确认大理寺答题完成"):
+            with self.assertRaisesRegex(QuizError, "答题后未确认大理寺答题完成"):
                 self.runner.run(["大理寺答题"])
         self.assertEqual(tap.call_count, 2)
         quiz.assert_called_once()
@@ -752,6 +912,26 @@ class DailyRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(QuizError, "大理寺答题.*未.*识别|未.*识别.*大理寺答题"):
             self.runner.run(["大理寺答题"])
         self.assertEqual(self.session.clicks, [])
+
+    def test_unreadable_arena_button_does_not_block_school_pickup(self):
+        self.session.list_name = "school_ready"
+        original = self.session.current_view
+
+        def current_view():
+            current = original()
+            if self.session.scene == "list":
+                current.blocks = [TextBlock("日次数：0/3", b.score, b.box) if b.text == "日次数：3/3" else b
+                                  for b in current.blocks if b.box != (424, 98, 43, 22)]
+                current.frame[98:120, 424:467] = (180, 200, 50)
+            return current
+
+        with patch.object(self.session, "current_view", side_effect=current_view):
+            result = self.runner.run(["卓越竞技场", "师门任务"])
+        self.assertEqual(result["reason"], "needs_attention")
+        self.assertEqual(result["completed"], ["师门任务"])
+        self.assertEqual(result["pending"], ["卓越竞技场"])
+        assert_clicks_in_boxes(self, [(x, y) for scene, x, y in self.session.clicks if scene == "list"],
+                               (653, 180, 46, 18))
 
     def test_no_broom_does_not_claim_arena_completed(self):
         self.session.list_name = "after_arena"

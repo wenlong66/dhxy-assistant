@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from quiz_core import QuizError
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 MAA_VERSION = "5.15.0"
 
 

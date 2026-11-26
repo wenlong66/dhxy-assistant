@@ -18,13 +18,27 @@ from typing import Any, Callable
 
 from maa_adapter import ROOT, MaaSession, load_config, save_image
 from quiz_core import OpenAIProvider, QuizError, QuizStore
-from quiz_vision import DeviceLock, Layout, ReadError, answer_once, write_json
+from quiz_vision import DeviceLock, Layout, ReadError, answer_once, read_for_answer, write_json
 from daily_tasks import DEFAULT_TASK_INTERVAL_MAX_SECONDS, DailyRunner
 from ring_tasks import RingRunner
 from ring_quiz import UnifiedQuizReader
 
 LOCAL_CONFIG = ROOT / "config/local.json"
 USER_SETTINGS = ("adb_path", "address", "account_scope", "layout")
+LOCAL_AI_CONFIG = ROOT / "config/ai.local.json"
+
+
+def ai_settings() -> dict[str, str]:
+    if not LOCAL_AI_CONFIG.exists():
+        return {"model": "", "api_key": ""}
+    try:
+        data = json.loads(LOCAL_AI_CONFIG.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        raise QuizError("无法读取 config/ai.local.json，请检查文件权限及 JSON 格式。") from None
+    if (not isinstance(data, dict) or set(data) != {"model", "api_key"}
+            or any(not isinstance(v, str) or not v.strip() for v in data.values())):
+        raise QuizError("config/ai.local.json 必须包含非空字符串 model 和 api_key。")
+    return {name: value.strip() for name, value in data.items()}
 
 
 def local_settings() -> dict[str, str]:
@@ -197,10 +211,10 @@ class DeviceBackend:
     def answer(self, *, use_ai=False, model="", api_key="", execute=False,
                allow_trial=False, layout_confirmed=False, max_daily_calls=30,
                random_answer=False, should_stop: Callable[[], bool] | None = None,
-               expected_view_token=None, random_percentage=0) -> dict:
+               expected_view_token=None, random_percentage=0, reader=None) -> dict:
         session, cfg = self._need_session()
         percentage = 100 if random_answer else random_percentage
-        use_ai = use_ai and percentage is None
+        use_ai = use_ai and percentage != 100
         if execute and not layout_confirmed:
             raise QuizError("Inspect and explicitly confirm the screenshot layout before submitting.")
         if use_ai and not model.strip():
@@ -211,7 +225,8 @@ class DeviceBackend:
         store = QuizStore(cfg["database"])
         try:
             provider = OpenAIProvider(model=model, api_key=api_key or None) if use_ai else None
-            reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
+            if reader is None:
+                reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
             return answer_once(reader, session, store, provider=provider, execute=execute,
                                layout_confirmed=layout_confirmed, allow_trial=allow_trial,
                                max_daily_calls=max_daily_calls, random_answer=random_answer,
@@ -227,7 +242,7 @@ class DeviceBackend:
         # The automatic reader validates the scene and layout before authorizing a click.
         options = {**options, "execute": True, "layout_confirmed": True,
                    "random_percentage": 100 if options.get("random_answer", False) else options.get("random_percentage", 0),
-                   "use_ai": False}
+                   "use_ai": options.get("use_ai", False) and not options.get("random_answer", False)}
         reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
         submitted = last_number = 0
         last_total = last_view = None
@@ -237,14 +252,15 @@ class DeviceBackend:
             if time.monotonic() >= deadline:
                 raise QuizError("等待新题或有效题目超时，自动答题已暂停。" + last_error)
             try:
-                observation = reader.read()
+                observation = read_for_answer(reader)
             except QuizError as exc:
                 last_error = str(exc)
                 time.sleep(0.5)
                 continue
             match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题", observation.question.stem)
             if match is None:
-                result = self.answer(should_stop=should_stop, expected_view_token=observation.question.view_token, **options)
+                result = self.answer(should_stop=should_stop, reader=reader,
+                                     expected_view_token=observation.question.view_token, **options)
                 if not result.get("click_sent"):
                     raise QuizError("当前题没有可提交答案，答题已暂停。")
                 if on_result is not None:
@@ -260,7 +276,8 @@ class DeviceBackend:
                     time.sleep(0.5)
                     continue
             try:
-                result = self.answer(should_stop=should_stop, expected_view_token=observation.question.view_token, **options)
+                result = self.answer(should_stop=should_stop, reader=reader,
+                                     expected_view_token=observation.question.view_token, **options)
             except ReadError as exc:
                 last_error = str(exc)
                 time.sleep(0.5)
@@ -298,10 +315,13 @@ class DeviceBackend:
         return result
 
     def auto_daily(self, *, selected, should_stop, on_result=None,
-                   task_interval_max=DEFAULT_TASK_INTERVAL_MAX_SECONDS, random_percentage=0) -> dict:
+                   task_interval_max=DEFAULT_TASK_INTERVAL_MAX_SECONDS, random_percentage=0,
+                   use_ai=False, model="", api_key="", max_daily_calls=30) -> dict:
         session, cfg = self._need_session()
         def answer_quiz(progress):
-            result = self.auto_answer(random_percentage=random_percentage, should_stop=should_stop, on_result=progress)
+            result = self.auto_answer(random_percentage=random_percentage, use_ai=use_ai, model=model, api_key=api_key,
+                                      max_daily_calls=max_daily_calls, allow_trial=use_ai,
+                                      should_stop=should_stop, on_result=progress)
             session.execute = True
             return result
         session.execute = True
@@ -314,18 +334,50 @@ class DeviceBackend:
     def auto_ring(self, *, should_stop, on_result=None, use_ai=False, model="", api_key="",
                   random_answer=False, allow_trial=False, max_daily_calls=30, random_percentage=0) -> dict:
         session, cfg = self._need_session()
+        reader = UnifiedQuizReader(session, Layout.load(cfg["layout"]), cfg["account_scope"])
+        retry_pending = False
 
         def answer_quiz():
+            nonlocal retry_pending
+            expected = None
             try:
-                return self.answer(execute=True, layout_confirmed=True, should_stop=should_stop,
-                                   random_answer=random_answer, random_percentage=random_percentage)
+                if retry_pending:
+                    if should_stop():
+                        raise QuizError("已停止，未准备答题重试。")
+                    observation = read_for_answer(reader)
+                    if should_stop():
+                        raise QuizError("已停止，未准备答题重试。")
+                    expected = observation.question.view_token
+                    store = QuizStore(cfg["database"])
+                    try:
+                        pending = store.db.execute("SELECT id FROM attempts WHERE qkey=? AND submitted_at IS NOT NULL "
+                                                   "AND outcome='pending' ORDER BY rowid DESC LIMIT 1",
+                                                   (observation.question.key,)).fetchone()
+                        if pending:
+                            store.feedback(pending["id"], "unknown",
+                                           "已确认答错对话关闭并重新识别同题；未确认正确答案。", source="game_ui")
+                    finally:
+                        store.close()
+                result = self.answer(execute=True, layout_confirmed=True, should_stop=should_stop, reader=reader,
+                                     expected_view_token=expected, random_answer=random_answer,
+                                     random_percentage=random_percentage, use_ai=use_ai, model=model,
+                                     api_key=api_key, allow_trial=allow_trial, max_daily_calls=max_daily_calls)
+                retry_pending = False
+                return result
             finally:
                 session.execute = True
+
+        def confirm_retry():
+            nonlocal retry_pending
+            if should_stop():
+                raise QuizError("已停止，未开放答题重试。")
+            reader.confirm_retry()
+            retry_pending = True
 
         session.execute = True
         try:
             return RingRunner(session, cfg["runtime_dir"], should_stop, on_result,
-                              answer_quiz=answer_quiz).run()
+                              answer_quiz=answer_quiz, on_quiz_retry=confirm_retry).run()
         finally:
             session.execute = False
 

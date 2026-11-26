@@ -214,6 +214,156 @@ class RingQuizTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_minor_question_and_option_ocr_drift_keeps_the_selected_answer(self):
+        original = fields()
+        original = {**original,
+                    "question": [replace(original["question"][0], text="你像一个小的太阳有一种温暖")],
+                    "option_A": [replace(original["option_A"][0], text="只要天边的明月")]}
+        changed = {**original,
+                   "question": [replace(original["question"][0], text="你像一个小小的太阳有一种温暖")],
+                   "option_A": [replace(original["option_A"][0], text="只要天边的明朋")]}
+        frames = iter(NS(shape=(470, 834, 3), fields=data) for data in (original, original, changed))
+        last = NS(shape=(470, 834, 3), fields=changed)
+        source = reader()
+        source.session.capture = lambda: next(frames, last)
+        with tempfile.TemporaryDirectory() as folder:
+            store = QuizStore(Path(folder) / "quiz.sqlite3")
+            try:
+                with patch("quiz_core.random.choice", return_value=("A", "只要天边的明月")) as choose:
+                    result = answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                         layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                    self.assertTrue(result["click_sent"])
+                    self.assertEqual(result["decision"]["answer_text"], "只要天边的明月")
+                    with self.assertRaises(QuizError):
+                        answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                    layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                    choose.assert_called_once()
+                source.session.click.assert_called_once()
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+            finally:
+                store.close()
+
+    def test_short_option_ocr_typo_keeps_the_original_mapping(self):
+        original = fields()
+        original = {**original, "option_A": [replace(original["option_A"][0], text="取暖")]}
+        changed = {**original, "option_A": [replace(original["option_A"][0], text="取嗳")]}
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in (original, changed)])
+        first = source.read()
+        current = source.read()
+        assert_same(first, current)
+        self.assertEqual(current.question.label_for("取暖"), "A")
+
+    def test_similar_options_that_actually_swap_are_not_frozen_at_old_positions(self):
+        original = fields(2)
+        original = {**original,
+                    "option_A": [replace(original["option_A"][0], text="北京大学")],
+                    "option_B": [replace(original["option_B"][0], text="南京大学")]}
+        changed = {**original,
+                   "option_A": [replace(original["option_A"][0], text="南京大学")],
+                   "option_B": [replace(original["option_B"][0], text="北京大学")]}
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in (original, changed)])
+        first = source.read()
+        current = source.read()
+        with self.assertRaises(ReadError):
+            assert_same(first, current)
+        self.assertEqual(current.question.label_for("北京大学"), "B")
+
+    def test_ocr_tolerance_does_not_hide_duplicate_current_options(self):
+        original = fields()
+        original = {**original, "option_B": [replace(original["option_B"][0], text="张九令")]}
+        duplicate = {**original, "option_B": original["option_A"]}
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in (original, duplicate)])
+        source.read()
+        with self.assertRaises(ReadError):
+            source.read()
+        source.session.click.assert_not_called()
+
+    def test_meaningful_changes_are_not_hidden_by_ocr_tolerance(self):
+        original = fields()
+        original = {**original, "question": [replace(original["question"][0], text="达到34级后不可以领取的任务是？")]}
+        for stem in ("达到35级后不可以领取的任务是？", "达到34级后可以领取的任务是？"):
+            changed = {**original, "question": [replace(original["question"][0], text=stem)]}
+            source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in (original, changed)])
+            with self.subTest(stem=stem), self.assertRaises(ReadError):
+                assert_same(source.read(), source.read())
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in
+                                (fields(3), fields(2), fields(3))])
+        first = source.read()
+        with self.assertRaises(ReadError):
+            assert_same(first, source.read())
+
+    def test_confirmed_retry_creates_new_popup_instance_but_keeps_bank_key_and_stability(self):
+        source = reader()
+        first = source.read()
+        with tempfile.TemporaryDirectory() as folder:
+            store = QuizStore(Path(folder) / "quiz.sqlite3")
+            try:
+                result = answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                     layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                with self.assertRaises(QuizError):
+                    answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                store.feedback(result["decision"]["attempt_id"], "unknown",
+                               "已确认失败对话关闭并重新出题；未确认正确答案。", source="game_ui")
+                source.confirm_retry()
+                retry = source.read()
+                self.assertEqual(first.question.key, retry.question.key)
+                self.assertNotEqual(first.question.instance_id, retry.question.instance_id)
+                self.assertEqual(retry.signature, source.read().signature)
+                retried = answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                     layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                self.assertTrue(retried["click_sent"])
+                self.assertNotEqual(result["decision"]["attempt_id"], retried["decision"]["attempt_id"])
+                self.assertEqual(source.session.click.call_count, 2)
+                with self.assertRaises(QuizError):
+                    answer_once(source, source.session, store, random_percentage=100, execute=True,
+                                layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                restarted = reader()
+                with self.assertRaises(QuizError):
+                    answer_once(restarted, restarted.session, store, random_percentage=100, execute=True,
+                                layout_confirmed=True, receipt_dir=Path(folder), sleep=lambda _: None)
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+            finally:
+                store.close()
+
+    def test_retry_identity_expires_when_question_changes(self):
+        changed = {**fields(), "question": [replace(fields()["question"][0], text="另一道题?")]}
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=data) for data in (fields(), changed, fields())])
+        source.confirm_retry()
+        retry = source.read()
+        next_question = source.read()
+        repeated = source.read()
+        self.assertEqual(next_question.question.instance_id, reader(changed).read().question.instance_id)
+        self.assertEqual(repeated.question.instance_id, reader().read().question.instance_id)
+        self.assertNotEqual(retry.question.instance_id, repeated.question.instance_id)
+
+    def test_confirmed_retry_still_rejects_changed_question_before_click(self):
+        changed = {**fields(), "question": [replace(fields()["question"][0], text="另一道题?")]}
+        source = reader(frames=[NS(shape=(470, 834, 3), fields=fields()),
+                                NS(shape=(470, 834, 3), fields=changed)])
+        source.confirm_retry()
+        store = QuizStore(":memory:")
+        try:
+            with self.assertRaises(ReadError):
+                answer_once(source, source.session, store, random_percentage=100, execute=True,
+                            layout_confirmed=True, sleep=lambda _: None)
+            source.session.click.assert_not_called()
+        finally:
+            store.close()
+
+    def test_unified_reader_forwards_confirmed_retry_only_to_popup_instance(self):
+        source = reader()
+        ocr = source.session.ocr.side_effect
+        popup_rois = set(source.layout.scaled(834, 470).values())
+        source.session.ocr.side_effect = lambda frame, roi, **kwargs: ocr(frame, roi, **kwargs) if roi in popup_rois else []
+        shared = UnifiedQuizReader(source.session, Layout.load(ROOT / "config/dali.layout.json"), SCOPE)
+        first = shared.read()
+        shared.confirm_retry()
+        current = shared.read()
+        self.assertEqual(first.question.key, current.question.key)
+        self.assertNotEqual(first.question.instance_id, current.question.instance_id)
+        self.assertEqual(current.signature, shared.read().signature)
+
     def test_answer_once_blocks_repeat_after_reader_and_store_restart(self):
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "quiz.sqlite3"

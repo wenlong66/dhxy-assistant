@@ -18,7 +18,7 @@ try:
     from PySide6.QtCore import QObject, Qt, Signal, QSize, QUrl
     from PySide6.QtGui import QDesktopServices, QPixmap
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
+        QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
         QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
         QPlainTextEdit, QScrollArea, QSpinBox, QSplitter, QTabWidget,
         QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
@@ -28,7 +28,7 @@ except ImportError:
     raise SystemExit(2)
 
 from daily_tasks import DEFAULT_TASK_INTERVAL_MAX_SECONDS, TASK_INTERVAL_MIN_SECONDS
-from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, local_settings, preview_png, save_local_settings
+from gui_backend import DeviceBackend, LOCAL_CONFIG, ROOT, ai_settings, local_settings, preview_png, save_local_settings
 from quiz_core import QuizError
 
 PREVIEW_INTERVAL_SECONDS = 10
@@ -296,7 +296,7 @@ class MainWindow(QMainWindow):
         task_l = QVBoxLayout(tasks)
         self.dali_check = QCheckBox("大理寺答题（日常／单题／自动）")
         self.dali_check.setChecked(True)
-        self.dali_check.setToolTip("日常有扫帚时直接完成，无扫帚时按统一随机比例查库或随机答题；也可单独启动答题。")
+        self.dali_check.setToolTip("日常有扫帚时直接完成，无扫帚时按统一概率查库、可选AI或随机答题；也可单独启动答题。")
         task_l.addWidget(self.dali_check)
         self.daily_checks = {"大理寺答题": self.dali_check}
         for name, label in (("师门任务", "师门任务"), ("帮派任务", "帮派任务"),
@@ -308,7 +308,7 @@ class MainWindow(QMainWindow):
                 check.setToolTip("优先使用已有扫帚；领取时优先文牒通关，否则普通领取后默认每约 5 秒检查完成提示。")
             self.daily_checks[name] = check
             task_l.addWidget(check)
-        task_note = QLabel("扫帚优先竞技场、宝图、大理寺；答题统一按右侧随机比例执行。其余按列表顺序，五环最后尝试；不处理野外封妖。")
+        task_note = QLabel("扫帚优先竞技场、宝图、大理寺；答题统一按右侧正常答题概率执行。其余按列表顺序，五环先核对50活跃度；不足先做下一项，完成后再判断；不处理野外封妖。")
         task_note.setWordWrap(True)
         task_l.addWidget(task_note)
         interval_row = QHBoxLayout()
@@ -318,13 +318,13 @@ class MainWindow(QMainWindow):
         self.daily_interval_max.setMinimum(TASK_INTERVAL_MIN_SECONDS)
         self.daily_interval_max.setValue(DEFAULT_TASK_INTERVAL_MAX_SECONDS)
         self.daily_interval_max.setSuffix(" 秒")
-        self.daily_interval_max.setToolTip("完成日常后，随机等待 10 秒至此最大值再执行下一项；最后一项不等待。仅本次打开助手有效。")
+        self.daily_interval_max.setToolTip("普通日常完成后随机等待 10 秒至此最大值；扫帚快速完成及大理寺答题后随机等 8–15 秒供奖励动画结束，不叠加长间隔。最后一项不等待。仅本次打开助手有效。")
         interval_row.addWidget(self.daily_interval_max)
         task_l.addLayout(interval_row)
         daily_controls = QHBoxLayout()
         self.daily_inspect_btn = make_button("检查日常列表", lambda: self.run_command("inspect_daily"))
         self.daily_start_btn = make_button("开始日常任务", self.start_daily)
-        self.daily_start_btn.setToolTip("从游戏主界面自动打开活动→扫帚列表，再领取、等待和核对次数；会消耗已有金扫帚，不调用 AI。")
+        self.daily_start_btn.setToolTip("从游戏主界面自动打开活动→扫帚列表，再领取、等待和核对次数；会消耗已有金扫帚，答题沿用右侧AI和概率设置。")
         daily_controls.addWidget(self.daily_inspect_btn)
         daily_controls.addWidget(self.daily_start_btn)
         task_l.addLayout(daily_controls)
@@ -340,40 +340,61 @@ class MainWindow(QMainWindow):
         self.layout_confirmed.setToolTip("单题手动提交先确认布局；自动答题自行识别并校验按钮。")
         options_l.addWidget(self.random_answer)
         ratio_row = QHBoxLayout()
-        ratio_row.addWidget(QLabel("随机比例："))
+        ratio_row.addWidget(QLabel("正常答题概率："))
         self.random_percentage = QSpinBox()
         self.random_percentage.setRange(0, 100)
-        self.random_percentage.setValue(0)
+        self.random_percentage.setValue(100)
         self.random_percentage.setSuffix("%")
-        self.random_percentage.setToolTip("50表示每题50%概率随机、50%概率查题库；题库未命中也随机，不代表实际答对率。")
+        self.random_percentage.setToolTip("60表示60%概率先查题库，未命中且启用AI时问AI，否则随机；另外40%直接随机，不保证60%答对。")
         self.random_answer.toggled.connect(self.random_percentage.setDisabled)
         ratio_row.addWidget(self.random_percentage)
+        self.ai_enabled = QCheckBox("启用 AI（题库未命中时）")
+        ratio_row.addWidget(self.ai_enabled)
         options_l.addLayout(ratio_row)
+        ai_form = QFormLayout()
+        self.max_calls = QSpinBox()
+        self.max_calls.setRange(1, 1000)
+        self.max_calls.setValue(30)
+        ai_form.addRow("每日 AI 次数上限：", self.max_calls)
+        options_l.addLayout(ai_form)
+        self.ai_enabled.toggled.connect(lambda _: self._refresh_controls())
+        self.random_answer.toggled.connect(lambda _: self._refresh_controls())
         options_l.addWidget(self.layout_confirmed)
-        learning_note = QLabel("2–4个选项共用策略；查库未命中随机。识别到正确对勾后收录正确答案，包含答错后揭示的答案；不调用 AI。")
+        learning_note = QLabel("先查已验证题库；未命中按 AI 勾选决定问 AI 或随机。AI 可能收费且答错；明确正确对勾后才收录。")
         learning_note.setWordWrap(True)
         options_l.addWidget(learning_note)
-        settings_row.addWidget(options, 2)
-
-        controls = QHBoxLayout()
+        controls = QGridLayout()
         self.preview_btn = make_button("预览本题答案", self.preview_answer)
         self.execute_btn = make_button("提交本题一次", self.execute_answer)
         self.auto_btn = make_button("开始自动答题", self.start_auto_answer)
-        self.auto_btn.setToolTip("所有任务共用2–4选项答题策略；按随机比例查库或随机，识别正确对勾后收录答案。")
+        self.auto_btn.setToolTip("所有任务共用2–4选项答题策略；按正常答题概率查库、可选AI或随机，识别正确对勾后收录答案。")
         self.pause_btn = make_button("暂停画面预览", self.toggle_preview)
-        controls.addWidget(self.preview_btn)
-        controls.addWidget(self.execute_btn)
-        controls.addWidget(self.auto_btn)
-        controls.addWidget(self.pause_btn)
-        left.addLayout(controls)
+        controls.addWidget(self.preview_btn, 0, 0)
+        controls.addWidget(self.execute_btn, 0, 1)
+        controls.addWidget(self.auto_btn, 1, 0)
+        controls.addWidget(self.pause_btn, 1, 1)
+        options_l.addLayout(controls)
 
+        result_row = QHBoxLayout()
+        self.answer_summary = QLineEdit("尚无答题结果")
+        self.answer_summary.setReadOnly(True)
+        self.answer_summary.setAccessibleName("答题与任务结果摘要")
+        self.result_details_btn = make_button("查看详情", self.show_answer_details)
+        self.result_details_btn.setEnabled(False)
+        result_row.addWidget(self.answer_summary, stretch=1)
+        result_row.addWidget(self.result_details_btn)
+        options_l.addLayout(result_row)
+        settings_row.addWidget(options, 2)
+        left.addStretch()
+
+        self.answer_dialog = QDialog(self)
+        self.answer_dialog.setWindowTitle("答题与任务结果详情")
+        self.answer_dialog.resize(700, 480)
+        detail_layout = QVBoxLayout(self.answer_dialog)
         self.answer_out = QPlainTextEdit()
         self.answer_out.setReadOnly(True)
-        self.answer_out.setPlaceholderText("答题建议、来源和提交回执会显示在这里。")
-        answer_box = QGroupBox("答题结果")
-        al = QVBoxLayout(answer_box)
-        al.addWidget(self.answer_out)
-        left.addWidget(answer_box, stretch=1)
+        detail_layout.addWidget(self.answer_out)
+        detail_layout.addWidget(make_button("关闭", self.answer_dialog.close))
 
         video_box = QGroupBox(f"游戏画面（默认 {PREVIEW_INTERVAL_SECONDS} 秒刷新，操作时复用截图）")
         vl = QVBoxLayout(video_box)
@@ -533,12 +554,21 @@ class MainWindow(QMainWindow):
             raise QuizError("题目 OCR 尚未通过：请先识别当前题并核对题干和选项。")
         if execute and not (automatic or self.random_answer.isChecked()) and not self.layout_confirmed.isChecked():
             raise QuizError("题目 OCR 已通过，请核对选项和区域框图，再勾选布局确认。")
-        return {"execute": execute, "random_percentage": self.quiz_percentage(),
+        return {"execute": execute, **self.quiz_options(),
                 "layout_confirmed": execute and (automatic or self.random_answer.isChecked()
                                                   or self.layout_confirmed.isChecked())}
 
     def quiz_percentage(self):
-        return 100 if self.random_answer.isChecked() else self.random_percentage.value()
+        return 100 if self.random_answer.isChecked() else 100 - self.random_percentage.value()
+
+    def quiz_options(self):
+        percentage = self.quiz_percentage()
+        use_ai = self.ai_enabled.isChecked() and percentage < 100
+        config = ai_settings() if use_ai else {"model": "", "api_key": ""}
+        if use_ai and (not config["model"] or not config["api_key"]):
+            raise QuizError("启用 AI 请先填写 config/ai.local.json 中的 model 和 api_key，或取消 AI 勾选。")
+        return {"random_percentage": percentage, "use_ai": use_ai,
+                **config, "max_daily_calls": self.max_calls.value(), "allow_trial": use_ai}
 
     def preview_answer(self):
         try:
@@ -565,7 +595,8 @@ class MainWindow(QMainWindow):
             params = self.answer_params(execute=True, automatic=True)
         except QuizError as exc:
             self.log(str(exc)); return
-        mode = (f"每题 {params['random_percentage']}% 概率随机，剩余概率查题库；未命中也随机，不调用 AI。")
+        fallback = "题库未命中时调用 AI（可能收费）" if params["use_ai"] else "题库未命中时随机"
+        mode = f"每题 {100 - params['random_percentage']}% 概率正常答题：先查题库，{fallback}；其余概率直接随机。"
         confirmation = QMessageBox.question(
             self, "开始自动答题", mode + "\n\n将从当前题连续答到本轮最后一题。"
             "程序会自动识别题目并检查布局；看到可靠正确对勾时收录答案，否则不推测对错。\n点击「断开 / 停止」可中止后续提交。",
@@ -582,11 +613,21 @@ class MainWindow(QMainWindow):
         if not selected:
             self.log("请先勾选要执行的日常任务。")
             return
+        try:
+            options = self.quiz_options()
+        except QuizError as exc:
+            self.log(str(exc))
+            return
         self.run_command("auto_daily", selected=selected, task_interval_max=self.daily_interval_max.value(),
-                         random_percentage=self.quiz_percentage())
+                         **{k: v for k, v in options.items() if k != "allow_trial"})
 
     def start_ring(self):
-        self.run_command("auto_ring", random_percentage=self.quiz_percentage())
+        try:
+            options = self.quiz_options()
+        except QuizError as exc:
+            self.log(str(exc))
+            return
+        self.run_command("auto_ring", **options)
 
     def save_feedback(self):
         result = self.outcome_combo.currentData()
@@ -623,17 +664,48 @@ class MainWindow(QMainWindow):
         self.save_settings_btn.setEnabled(not busy and not self.connected)
         self.random_answer.setEnabled(not busy)
         self.random_percentage.setEnabled(not busy and not self.random_answer.isChecked())
+        self.ai_enabled.setEnabled(not busy and not self.random_answer.isChecked())
+        self.max_calls.setEnabled(not busy and self.ai_enabled.isChecked() and not self.random_answer.isChecked())
         self.layout_confirmed.setEnabled(not busy)
         for widget in (self.adb_edit, self.addr_edit, self.scope_edit, self.layout_edit):
             widget.setEnabled(not busy and not self.connected)
         self.status.setText("执行中…" if busy else ("已连接" if self.connected else "未连接"))
+
+    def show_answer_details(self):
+        self.answer_dialog.show()
+        self.answer_dialog.raise_()
+        self.answer_dialog.activateWindow()
+
+    def _show_result(self, summary: str, result=None):
+        self.answer_summary.setText(" ".join(summary.split()))
+        self.answer_summary.setCursorPosition(0)
+        if result is not None:
+            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+            self.result_details_btn.setEnabled(True)
+
+    def _show_answer_result(self, result):
+        decision = result.get("decision") or {}
+        state = "已提交" if result.get("click_sent") else ("仅预览" if decision.get("can_submit") else "未提交")
+        number = (f" {result['question_number']}/{result['question_total']} 题"
+                  if "question_number" in result else "")
+        origin = {"bank": "题库", "cache": "缓存", "openai": "AI", "random": "随机",
+                  "random_unreadable": "识别不完整，随机兜底", "bank_unreadable": "识别不完整，题库匹配"}.get(
+                      decision.get("origin"), "未知来源")
+        feedback = {"correct": "答对", "wrong": "答错，已识别正确选项"}.get(result.get("outcome"), "反馈未确认")
+        summary = f"{state}{number} · {feedback} · {origin}" if result.get("click_sent") else f"{state}{number} · {origin}"
+        if decision.get("answer_text"):
+            answer = decision["answer_text"]
+            if decision.get("origin") == "random_unreadable" and answer == f"*{decision.get('label')}*":
+                answer = "选项文字未识别"
+            summary += f" · {decision.get('label') or ''} {answer}"
+        self._show_result(summary, result)
 
     def on_event(self, kind: str, payload):
         if kind == "daily_progress":
             self.log(payload["message"])
             return
         if kind == "auto_progress":
-            self.answer_out.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+            self._show_answer_result(payload)
             attempt = (payload.get("decision") or {}).get("attempt_id")
             if attempt:
                 self.attempt_edit.setText(attempt)
@@ -701,7 +773,7 @@ class MainWindow(QMainWindow):
             self.layout_confirmed.setChecked(False)
             self.log("题号、题干和选项校验通过；核对布局后勾选确认即可提交。")
         elif command == "answer":
-            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+            self._show_answer_result(result)
             decision = result.get("decision") or {}
             if result.get("click_sent") and decision.get("attempt_id"):
                 self.attempt_edit.setText(decision["attempt_id"])
@@ -712,20 +784,23 @@ class MainWindow(QMainWindow):
                 self.log("本题仅完成查询／预览，未点击游戏。")
         elif command == "auto_answer":
             state = "本轮最后一题已提交" if result["reason"] == "completed" else "已停止"
+            self._show_result(f"自动答题{state} · 共提交 {result['submitted']} 题")
             self.log(f"自动答题{state}；本次共提交 {result['submitted']} 题，正确标记的学习结果见逐题回执。")
         elif command == "inspect_daily":
             self.show_frame(result["png"])
-            self.answer_out.setPlainText(json.dumps({k: v for k, v in result.items() if k != "png"}, ensure_ascii=False, indent=2))
-            self.log("日常列表识别通过；请核对任务次数与按钮。" if result["valid"] else "日常识别暂停：" + result["error"])
+            summary = "日常列表识别通过；请核对任务次数与按钮。" if result["valid"] else "日常识别暂停：" + result["error"]
+            self._show_result(summary, {k: v for k, v in result.items() if k != "png"})
+            self.log(summary)
             self.log("日常诊断目录：" + result["diagnostics"])
         elif command == "auto_daily":
-            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
             states = {"completed": "所选日常均已核对完成", "stopped": "已停止后续操作",
                       "needs_attention": "竞技场缺少可用金扫帚，仍有未完成项"}
+            self._show_result(states[result["reason"]], result)
             self.log(states[result["reason"]])
         elif command == "auto_ring":
-            self.answer_out.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
-            self.log("200环已停止后续操作。" if result["reason"] == "stopped" else result["message"])
+            summary = "200环已停止后续操作。" if result["reason"] == "stopped" else result["message"]
+            self._show_result(summary, result)
+            self.log(summary)
         elif command == "bank":
             self.bank_table.setRowCount(len(result))
             for i, row in enumerate(result):

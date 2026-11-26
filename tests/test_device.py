@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 from maa_adapter import ROOT, MaaSession, ldplayer_config, load_config, load_maa, select_device, wait_job
 from quiz_core import AIAnswer, QuizError, QuizStore
 from quiz_vision import (DeviceLock, Layout, QuizReader, ReadError, TextBlock, answer_once, assert_same,
-                         join_blocks, parse_fields)
+                         join_blocks, parse_fields, read_for_answer)
 from setup_ocr import verify_file, verify_models
 
 
@@ -177,6 +177,41 @@ class ParsingTests(unittest.TestCase):
     def test_index_must_fit_total(self):
         data = fields(); data["question"] = [TextBlock("第11/10题：题目", .99, (0, 0, 100, 20))]
         with self.assertRaises(QuizError): observation(data=data)
+
+    def test_reader_reuses_minor_ocr_variations_but_not_new_question_numbers(self):
+        source = fields()
+        source = {**source,
+                  "question": [replace(source["question"][0], text="第1/10题：你像一个小的太阳有一种温暖")],
+                  "option_A": [replace(source["option_A"][0], text="只要天边的明月")]}
+        changed = {**source,
+                   "question": [replace(source["question"][0], text="第1/10题：你像一个小小的太阳有一种温暖")],
+                   "option_A": [replace(source["option_A"][0], text="只要天边的明朋")]}
+        next_question = {**changed, "question": [replace(changed["question"][0], text="第2/10题：你像一个小小的太阳有一种温暖")]}
+        reader = QuizReader(NS(address="offline"), Layout.load(ROOT / "config/dali.layout.json"), "offline")
+        frame = NS(shape=(470, 834, 3))
+        reader.inspect = MagicMock(side_effect=[(frame, time.monotonic(), data, {}) for data in (source, changed, next_question)])
+        first = reader.read()
+        assert_same(first, reader.read())
+        with self.assertRaises(ReadError):
+            assert_same(first, reader.read())
+
+    def test_numbered_question_masks_unknown_text_but_keeps_the_question_number_guard(self):
+        import numpy as np
+        clear = fields()
+        masked = {**clear, "question": [replace(clear["question"][0], text="第1/10题：测试等级为34级，不�的是？")]}
+        next_question = {**clear, "question": [replace(clear["question"][0], text="第2/10题：测试等级为34级，不正确的是？")]}
+        frame = np.zeros((470, 834, 3), dtype=np.uint8)
+        reader = QuizReader(NS(address="offline"), Layout.load(ROOT / "config/dali.layout.json"), "offline")
+        reader.inspect = MagicMock(side_effect=[(frame, time.monotonic(), data, {})
+                                               for data in (masked, clear, next_question)])
+        first = read_for_answer(reader)
+        self.assertIn("*", first.question.stem)
+        self.assertFalse(first.question.is_readable)
+        second = read_for_answer(reader)
+        self.assertFalse(second.question.is_readable)
+        assert_same(first, second)
+        with self.assertRaises(ReadError):
+            assert_same(first, read_for_answer(reader))
 
     def test_instance_stable_across_reads(self):
         self.assertEqual(observation().question.view_token, observation().question.view_token)

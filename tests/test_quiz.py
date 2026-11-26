@@ -52,6 +52,19 @@ class QuestionTests(unittest.TestCase):
     def test_non_quiz_scene_rejected(self):
         with self.assertRaises(QuizError):
             Question("test", tuple(zip("ABCD", ["1", "2", "3", "4"])), "1", scene="login_verification")
+    def test_masked_question_characters_are_wildcards_not_option_wildcards(self):
+        from dataclasses import replace
+        question = q(stem="我想要怒放的生命，不需要40级？")
+        masked = replace(question, stem="我想要*生命，不需要40级？", is_readable=False, visual_token="offline")
+        self.assertTrue(question.matches_content(masked.stem, masked.options))
+        self.assertTrue(masked.matches_content(question.stem, question.options))
+        self.assertFalse(masked.matches_content("我想要怒放的生命，需要40级？", question.options))
+        self.assertFalse(masked.matches_content("我想要怒放的生命，不需要41级？", question.options))
+        self.assertFalse(question.matches_content("完全不同的题目？", question.options))
+        self.assertFalse(replace(masked, stem="***").matches_content(question.stem, question.options))
+        options = (("A", "*"), *question.options[1:])
+        self.assertFalse(question.matches_content(question.stem, options))
+
     def test_game_day_0500_cn(self):
         self.assertEqual(game_day(datetime(2026, 11, 9, 20, 59, tzinfo=timezone.utc)), "2026-11-09")
         self.assertEqual(game_day(datetime(2026, 11, 9, 21, 0, tzinfo=timezone.utc)), "2026-11-10")
@@ -67,6 +80,25 @@ class StoreTests(unittest.TestCase):
     def tearDown(self): self.store.close()
     def test_cache_miss_without_ai(self):
         self.assertEqual(self.store.resolve(q()).status, "miss")
+    def test_unreadable_random_wrong_does_not_conflict_with_a_reliable_reveal(self):
+        from dataclasses import replace
+        for confirmation in ("reveal", "ai_feedback"):
+            with self.subTest(confirmation=confirmation):
+                question = q(stem=f"测试{confirmation}题？", instance=confirmation)
+                unreadable = replace(question, is_readable=False, visual_token="offline-image")
+                with patch("quiz_core.random.choice", return_value=question.options[0]):
+                    decision = self.store.resolve(unreadable)
+                self.assertTrue(self.store.claim_submission(decision, unreadable))
+                self.store.feedback(decision.attempt_id, "wrong", "离线试错反馈", source="game_ui")
+                if confirmation == "reveal":
+                    self.store.learn_revealed_answer(question, "北京", "可靠正确标记")
+                else:
+                    candidate = self.store.resolve(replace(question, instance_id="readable"), self.ai)
+                    self.assertEqual(self.ai.rejected, [])
+                    self.store.feedback(candidate.attempt_id, "correct", "可靠正确标记")
+                learned = self.store.resolve(replace(question, instance_id="next"))
+                self.assertEqual((learned.status, learned.answer_text), ("verified", "北京"))
+
     def test_switching_mode_cannot_resubmit_same_question_instance(self):
         normal = q()
         first = self.store.resolve(normal, self.ai, allow_trial=True)
@@ -140,6 +172,39 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(choose.call_count, 1)
         self.assertEqual(self.ai.calls, 1)
 
+    def test_mixed_ai_fallback_and_repeated_decision_do_not_rebill(self):
+        with patch("quiz_core.random.randrange", return_value=40) as strategy:
+            first = self.store.resolve(q(), self.ai, random_percentage=40, allow_trial=True)
+            again = self.store.resolve(q(), self.ai, random_percentage=40, allow_trial=True)
+        self.assertEqual((first.origin, first.label, first.can_submit), ("openai", "A", True))
+        self.assertEqual(again.attempt_id, first.attempt_id)
+        self.assertEqual(self.ai.calls, 1)
+        strategy.assert_called_once_with(100)
+
+    def test_mixed_ai_direct_random_branch_never_calls_provider(self):
+        with patch("quiz_core.random.randrange", return_value=39), \
+                patch("quiz_core.random.choice", return_value=q().options[1]):
+            result = self.store.resolve(q(), self.ai, random_percentage=40, allow_trial=True)
+        self.assertEqual((result.origin, result.label), ("random", "B"))
+        self.assertEqual(self.ai.calls, 0)
+
+    def test_mixed_ai_verified_bank_hit_does_not_call_provider(self):
+        first = self.store.resolve(q(), self.ai)
+        self.store.feedback(first.attempt_id, "correct", "Verified fixture")
+        result = self.store.resolve(q(instance="bank-ai"), self.ai, random_percentage=0, allow_trial=True)
+        self.assertEqual(result.origin, "bank")
+        self.assertEqual(self.ai.calls, 1)
+
+    def test_mixed_ai_error_remains_sticky_without_random_fallback(self):
+        provider = unittest.mock.Mock()
+        provider.answer.side_effect = QuizError("offline failure")
+        with self.assertRaises(QuizError):
+            self.store.resolve(q(), provider, random_percentage=0, allow_trial=True)
+        again = self.store.resolve(q(), provider, random_percentage=0, allow_trial=True)
+        self.assertFalse(again.can_submit)
+        self.assertEqual(again.status, "needs_review")
+        provider.answer.assert_called_once()
+
     def test_mixed_percentage_validation(self):
         for value in (-1, 101, True, False, 1.0, "50"):
             with self.subTest(value=value), self.assertRaises(QuizError):
@@ -161,14 +226,14 @@ class StoreTests(unittest.TestCase):
 
     def test_mixed_fallback_for_missing_unverified_or_unmappable_bank(self):
         with patch("quiz_core.random.choice", return_value=q().options[1]):
-            missing = self.store.resolve(q(instance="missing"), self.ai, random_percentage=0)
+            missing = self.store.resolve(q(instance="missing"), random_percentage=0)
         self.assertEqual(missing.origin, "random")
         candidate = self.store.resolve(q(), self.ai)
         for status, answer in (("candidate", "北京"), ("needs_review", "北京"), ("invalid", "北京"),
                                ("abstain", None), ("asking", None), ("verified", "天津")):
             with self.subTest(status=status), patch("quiz_core.random.choice", return_value=q().options[1]):
                 self.store.db.execute("UPDATE answers SET status=?,answer_text=? WHERE qkey=?", (status, answer, candidate.question_key))
-                decision = self.store.resolve(q(instance=status), self.ai, random_percentage=0, allow_trial=True)
+                decision = self.store.resolve(q(instance=status), random_percentage=0, allow_trial=True)
                 self.assertEqual((decision.origin, decision.label, decision.can_submit), ("random", "B", True))
         self.assertEqual(self.ai.calls, 1)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 1)

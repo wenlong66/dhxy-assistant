@@ -1,6 +1,7 @@
 """Strict Dali scene parsing and one-question execution. No automatic correctness claims."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -8,13 +9,22 @@ import random
 import re
 import time
 import unicodedata
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from quiz_core import Question, QuizError, QuizStore, digest, game_day, normalize
+import numpy as np
+
+from local_vision import contains
+from quiz_core import OCR_SIGNIFICANT_TEXT, Question, QuizError, QuizStore, digest, game_day, normalize
 from quiz_feedback import correct_choice
 
 INPUT_PAUSE_SECONDS = (0.3, 1.0)
+QUESTION_ICON_COLOR_GAP = 15
+QUESTION_ICON_MINIMUM_COVERAGE = .02
+QUESTION_LINE_CENTER_TOLERANCE = .45
+UNREADABLE_BUTTON_PIXEL_TOLERANCE = 8
+UNREADABLE_CHARACTERS = re.compile(r"[�□▯]")
 
 
 class ReadError(QuizError):
@@ -28,11 +38,16 @@ class TextBlock:
     box: tuple[int, int, int, int]
 
 
-def join_blocks(blocks: list[TextBlock], minimum: float) -> str:
-    if not blocks or any(not b.text.strip() or not math.isfinite(b.score) or b.score < minimum for b in blocks):
+def join_blocks(blocks: list[TextBlock], minimum: float, *, mask_unreadable=False) -> str:
+    if not blocks or (not mask_unreadable and any(
+            not b.text.strip() or not math.isfinite(b.score) or b.score < minimum for b in blocks)):
         raise QuizError("Missing/low-confidence OCR text; inspect the ROI, do not guess.")
     if any(len(b.box) != 4 or b.box[2] <= 0 or b.box[3] <= 0 for b in blocks):
         raise QuizError("Invalid OCR bounding box.")
+    def render(block):
+        if mask_unreadable and (not block.text.strip() or not math.isfinite(block.score) or block.score < minimum):
+            return "*"
+        return UNREADABLE_CHARACTERS.sub("*", block.text.strip()) if mask_unreadable else block.text.strip()
     # Group slightly skewed fragments of the same line, then order left-to-right.
     rows = []
     for b in sorted(blocks, key=lambda b: b.box[1] + b.box[3] / 2):
@@ -41,7 +56,63 @@ def join_blocks(blocks: list[TextBlock], minimum: float) -> str:
             rows[-1][2].append(b)
         else:
             rows.append([center, b.box[3], [b]])
-    return "\n".join("".join(b.text.strip() for b in sorted(row[2], key=lambda b: b.box[0])) for row in rows)
+    return "\n".join("".join(render(b) for b in sorted(row[2], key=lambda b: b.box[0])) for row in rows)
+
+
+def question_icon_visible(frame, icon_roi):
+    x, y, w, h = icon_roi
+    icon = frame[y:y + h, x:x + w].astype(int)
+    blue, green, red = (icon[:, :, i] for i in range(3))
+    colored = ((green - red > QUESTION_ICON_COLOR_GAP) | (blue - red > QUESTION_ICON_COLOR_GAP))
+    return float(colored.mean()) >= QUESTION_ICON_MINIMUM_COVERAGE
+
+
+def join_question_blocks(blocks, minimum, frame, icon_roi, *, mask_unreadable=False):
+    if icon_roi is not None:
+        kept = [b for b in blocks if not contains(icon_roi, b.box)]
+        if kept and len(kept) != len(blocks) and question_icon_visible(frame, icon_roi):
+            blocks = kept
+    if not mask_unreadable and any("*" in b.text or UNREADABLE_CHARACTERS.search(b.text) for b in blocks):
+        raise QuizError("Question contains unrecognized characters.")
+    return join_blocks(blocks, minimum, mask_unreadable=mask_unreadable)
+
+
+def read_question_blocks(session, frame, roi, minimum, icon_roi=None):
+    blocks = session.ocr(frame, roi)
+    try:
+        join_question_blocks(blocks, minimum, frame, icon_roi)
+        return blocks
+    except QuizError:
+        pass
+    if not blocks or any(len(b.box) != 4 or min(b.box[2:]) <= 0 or not contains(roi, b.box) for b in blocks):
+        return blocks
+    trusted = [b for b in blocks if b.text.strip() and math.isfinite(b.score) and b.score >= minimum]
+    if not trusted:
+        return blocks
+    line = max(trusted, key=lambda b: b.box[2])
+    center = line.box[1] + line.box[3] / 2
+    if any(abs(b.box[1] + b.box[3] / 2 - center)
+           > min(b.box[3], line.box[3]) * QUESTION_LINE_CENTER_TOLERANCE for b in blocks):
+        return blocks
+    left, top = min(b.box[0] for b in blocks), min(b.box[1] for b in blocks)
+    right, bottom = max(b.box[0] + b.box[2] for b in blocks), max(b.box[1] + b.box[3] for b in blocks)
+    reread = session.ocr(frame, (left, top, right - left, bottom - top), single_line=True)
+    try:
+        text = join_question_blocks(reread, minimum, frame, icon_roi)
+    except QuizError:
+        return blocks
+    if any(not contains(roi, b.box) for b in reread):
+        return blocks
+    observed_tokens = Counter(token for block in blocks
+                              for token in OCR_SIGNIFICANT_TEXT.findall(normalize(block.text)))
+    if Counter(OCR_SIGNIFICANT_TEXT.findall(normalize(text))) - observed_tokens:
+        return blocks
+    for block in trusted:
+        remaining = iter(OCR_SIGNIFICANT_TEXT.findall(normalize(text)))
+        if any(not any(token == current for current in remaining)
+               for token in OCR_SIGNIFICANT_TEXT.findall(normalize(block.text))):
+            return blocks
+    return reread
 
 
 class Layout:
@@ -90,10 +161,24 @@ class Observation:
     frame: object = None
     question_roi: tuple[int, int, int, int] | None = None
     option_rois: dict[str, tuple[int, int, int, int]] | None = None
+    question_icon_roi: tuple[int, int, int, int] | None = None
 
     @property
     def signature(self):
         return digest([self.question.view_token, self.size, self.buttons])
+
+
+class QuestionReadError(ReadError):
+    def __init__(self, message, observation):
+        super().__init__(message)
+        self.observation = observation
+
+
+def read_for_answer(reader):
+    try:
+        return reader.read()
+    except QuestionReadError as exc:
+        return exc.observation
 
 
 def option_labels(fields, minimum):
@@ -111,19 +196,50 @@ def option_labels(fields, minimum):
     return labels
 
 
+def partial_option_buttons_confirmed(frame, buttons):
+    if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+        return False
+    for x, y, w, h in buttons.values():
+        if min(x, y) < 0 or min(w, h) <= 0 or y + h > frame.shape[0] or x + w > frame.shape[1]:
+            return False
+        pixels = frame[y + h // 4:y + 3 * h // 4, x + w * 55 // 100:x + w * 90 // 100]
+        if not pixels.size:
+            return False
+        blue, green, red = (pixels[:, :, i].astype(int) for i in range(3))
+        gold = (red > 180) & (green > 155) & (blue > 110) & (red >= green) & (green >= blue) & (red - blue >= 8)
+        if gold.mean() < .5:
+            return False
+    return True
+
+
 def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
                  captured_at: float, frame=None, *, random_answer=False) -> Observation:
     labels = option_labels(fields, layout.minimum)
     names = ["question", *[f"label_{k}" for k in labels], *[f"option_{k}" for k in labels]]
     text = {}
+    unreadable_options = []
     for name in names:
         try:
-            text[name] = join_blocks(fields.get(name, []), layout.minimum)
+            text[name] = (join_question_blocks(fields.get(name, []), layout.minimum, frame, None,
+                                               mask_unreadable=True) if name == "question" else
+                          join_blocks(fields.get(name, []), layout.minimum))
+            if name.startswith("option_") and ("*" in text[name] or UNREADABLE_CHARACTERS.search(text[name])):
+                raise QuizError("Option contains unrecognized characters.")
         except QuizError as exc:
-            raise QuizError(f"OCR 区域 {name} 未通过：{exc}") from exc
+            if not name.startswith("option_") or not isinstance(frame, np.ndarray):
+                raise QuizError(f"OCR 区域 {name} 未通过：{exc}") from exc
+            label = name[-1]
+            unreadable_options.append(label)
+            text[name] = f"*{label}*"
+    regions = layout.scaled(*size)
     for label in labels:
-        if normalize(text[f"label_{label}"]).upper() != label:
+        blocks = fields.get(f"label_{label}", [])
+        if (normalize(text[f"label_{label}"]).upper() != label or
+                (unreadable_options and any(not contains(regions[f"label_{label}"], b.box) for b in blocks))):
             raise QuizError(f"Option {label} label is missing/misaligned; inspect the layout.")
+    if unreadable_options and (frame.shape != (size[1], size[0], 3) or not partial_option_buttons_confirmed(
+            frame, {k: layout.scaled(*size, group="buttons")[k] for k in labels})):
+        raise QuizError("无法确认选项按钮画面，未答题。")
     stem = unicodedata.normalize("NFKC", text["question"])
     match = re.match(r"^第\s*(\d+)\s*/\s*(\d+)\s*题\s*:\s*(.+)$", stem, re.S)
     if not match or not 1 <= int(match[1]) <= int(match[2]) <= 100:
@@ -131,7 +247,11 @@ def parse_fields(fields, layout: Layout, size, device_id: str, scope: str,
     # Stable across process restarts: same account/day/instance/question number cannot be re-clicked.
     instance = digest([game_day(), scope, device_id, int(match[1]), int(match[2])])
     options = tuple((k, re.sub(r"\s*\n\s*", "", text[f"option_{k}"])) for k in labels)
-    question = Question(stem, options, instance, scope=scope)
+    x, y, w, h = layout.scaled(*size)["question"]
+    pixels = hashlib.sha256(frame[y:y + h, x:x + w].tobytes()).hexdigest() if isinstance(frame, np.ndarray) else ""
+    visual_token = digest([game_day(), scope, device_id, pixels]) if pixels else ""
+    question = Question(stem, options, instance, scope=scope, is_readable="*" not in stem and not unreadable_options,
+                        visual_token=visual_token, unreadable_options=tuple(unreadable_options))
     buttons = layout.scaled(*size, group="buttons")
     return Observation(question, tuple(size), {k: buttons[k] for k in labels}, captured_at, frame,
                        layout.scaled(*size)["question"],
@@ -142,29 +262,101 @@ class QuizReader:
     def __init__(self, session, layout: Layout, scope: str, *, random_answer=False):
         self.session, self.layout, self.scope = session, layout, scope
         self.random_answer = random_answer
+        self.previous_question = None
+
+    def parse(self, fields, size, captured_at, frame):
+        observation = parse_fields(fields, self.layout, size, self.session.address, self.scope, captured_at,
+                                   frame, random_answer=self.random_answer)
+        previous = self.previous_question
+        if (previous is not None and previous.instance_id == observation.question.instance_id
+                and previous.matches_content(observation.question.stem, observation.question.options)):
+            observation = replace(observation, question=replace(
+                previous, is_readable=previous.is_readable and observation.question.is_readable))
+        self.previous_question = observation.question
+        if not observation.question.is_readable:
+            raise QuestionReadError("OCR 区域 question 包含未识别字符（*），使用随机兜底。", observation)
+        return observation
 
     def inspect(self):
         frame = self.session.capture()
         captured_at = time.monotonic()
         height, width = frame.shape[:2]
         rois = self.layout.scaled(width, height)
-        fields = {name: self.session.ocr(frame, roi, single_line=name.startswith("label_"))
+        fields = {name: (read_question_blocks(self.session, frame, roi, self.layout.minimum)
+                         if name == "question" else
+                         self.session.ocr(frame, roi, single_line=name.startswith("label_")))
                   for name, roi in rois.items()}
         return frame, captured_at, fields, rois
 
     def read(self):
         try:
             frame, captured, fields, rois = self.inspect()
-            return parse_fields(fields, self.layout, (frame.shape[1], frame.shape[0]),
-                                self.session.address, self.scope, captured, frame, random_answer=self.random_answer)
+            return self.parse(fields, (frame.shape[1], frame.shape[0]), captured, frame)
+        except QuestionReadError:
+            raise
         except QuizError as exc:
             raise ReadError(str(exc)) from exc
 
 
 def assert_same(first: Observation, current: Observation, max_age: float = 20):
     age = time.monotonic() - current.captured_at
-    if current.signature != first.signature or age < 0 or age > max_age:
-        raise ReadError("Question/layout changed or screenshot is stale; no click performed.")
+    if age < 0 or age > max_age:
+        raise ReadError(f"Screenshot is stale ({age:.1f}s); no click performed.")
+    if current.size != first.size or current.buttons != first.buttons:
+        raise ReadError("Question/layout changed: screenshot size or answer buttons differ; no click performed.")
+    if current.signature != first.signature:
+        raise ReadError("Question/layout changed: question or option identity differs; no click performed.")
+
+
+def recheck_for_answer(first: Observation, current: Observation) -> Observation:
+    unknown = set(first.question.unreadable_options) | set(current.question.unreadable_options)
+    if unknown:
+        if (first.size != current.size or first.buttons != current.buttons or
+                first.question.scope != current.question.scope or
+                first.question.submission_token != current.question.submission_token or
+                normalize(first.question.stem) != normalize(current.question.stem) or
+                not first.option_rois or first.option_rois != current.option_rois or
+                not isinstance(first.frame, np.ndarray) or not isinstance(current.frame, np.ndarray)):
+            raise ReadError("题目或选项布局已变化，未答题。")
+        old, new = dict(first.question.options), dict(current.question.options)
+        if (old.keys() != new.keys() or any(normalize(old[k]) != normalize(new[k]) for k in old if k not in unknown)):
+            raise ReadError("题目选项已变化，未答题。")
+        for label in unknown:
+            x, y, w, h = first.buttons[label]
+            before = first.frame[y:y+h, x:x+w].astype(np.int16)
+            after = current.frame[y:y+h, x:x+w].astype(np.int16)
+            if before.shape != after.shape or np.any(np.abs(before - after) > UNREADABLE_BUTTON_PIXEL_TOLERANCE):
+                raise ReadError("未识别选项按钮画面已变化，未答题。")
+        question = replace(first.question, is_readable=False,
+                           options=tuple((k, f"*{k}*" if k in unknown else v) for k, v in first.question.options),
+                           unreadable_options=tuple(k for k, _ in first.question.options if k in unknown))
+        current = replace(current, question=question)
+        assert_same(replace(first, question=question), current)
+        return current
+    try:
+        assert_same(first, current)
+    except ReadError:
+        if (not first.question.visual_token or not current.question.visual_token
+                or first.question_icon_roi is None or first.question_icon_roi != current.question_icon_roi
+                or first.question.scope != current.question.scope
+                or first.size != current.size or first.buttons != current.buttons
+                or not first.option_rois or first.option_rois != current.option_rois
+                or first.frame is None or current.frame is None):
+            raise
+        same_options = first.question.matches_content(first.question.stem, current.question.options)
+        same_image = first.question.visual_token == current.question.visual_token
+        uncertain_stem = not first.question.is_readable or not current.question.is_readable
+        if not same_image and not (same_options and uncertain_stem):
+            raise
+        if not same_options:
+            for x, y, w, h in first.option_rois.values():
+                if first.frame[y:y + h, x:x + w].tobytes() != current.frame[y:y + h, x:x + w].tobytes():
+                    raise
+        current = replace(current, question=replace(first.question, is_readable=False))
+        assert_same(first, current)
+    if not first.question.is_readable and current.question.is_readable:
+        current = replace(current, question=replace(current.question, is_readable=False))
+    return current
 
 
 class DeviceLock:
@@ -208,6 +400,8 @@ def random_click_point(box):
 def record_revealed_feedback(session, store, observation, attempt_id, selected_label, *, sleep, require_active):
     if observation.frame is None or observation.question_roi is None or observation.option_rois is None:
         return "awaiting_manual_feedback"
+    if not observation.question.is_readable:
+        return "awaiting_manual_feedback"
     if any(correct_choice(observation.frame, box) for box in observation.buttons.values()):
         return "awaiting_manual_feedback"
     for _ in range(5):
@@ -217,7 +411,9 @@ def record_revealed_feedback(session, store, observation, attempt_id, selected_l
         if tuple(frame.shape[:2][::-1]) != observation.size:
             return "awaiting_manual_feedback"
         try:
-            stem = join_blocks(session.ocr(frame, observation.question_roi), .8)
+            blocks = read_question_blocks(session, frame, observation.question_roi, .8,
+                                          observation.question_icon_roi)
+            stem = join_question_blocks(blocks, .8, frame, observation.question_icon_roi)
         except QuizError:
             return "awaiting_manual_feedback"
         if normalize(stem) != normalize(observation.question.stem):
@@ -255,10 +451,9 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
     require_active()
     if execute and not layout_confirmed:
         raise QuizError("Inspect the overlay/OCR first, then explicitly pass --layout-confirmed.")
-    first = reader.read()
+    first = read_for_answer(reader)
     sleep(0.25)
-    stable = reader.read()
-    assert_same(first, stable)
+    stable = recheck_for_answer(first, read_for_answer(reader))
     require_active()
     if expected_view_token is not None and stable.question.view_token != expected_view_token:
         raise ReadError("题目已切换，当前提交取消；未调用 AI 或点击游戏。")
@@ -271,8 +466,7 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
         return result
     require_active()
     # AI may take time; never use an old frame or letter-to-button mapping.
-    current = reader.read()
-    assert_same(stable, current)
+    current = recheck_for_answer(stable, read_for_answer(reader))
     remaining = random.uniform(*INPUT_PAUSE_SECONDS)
     while remaining > 0:
         require_active()
@@ -280,8 +474,10 @@ def answer_once(reader, session, store: QuizStore, *, provider=None, execute=Fal
         sleep(interval)
         remaining -= interval
     require_active()
-    final = reader.read()
-    assert_same(current, final)
+    final = recheck_for_answer(current, read_for_answer(reader))
+    if not final.question.is_readable and decision.origin not in {"random_unreadable", "bank_unreadable"}:
+        decision = store.resolve(final.question, random_percentage=100)
+        result = {**result, "decision": decision.to_dict()}
     label = final.question.label_for(decision.answer_text)
     if label is None or label != decision.label:
         raise QuizError("Answer is not uniquely mapped to the current option.")

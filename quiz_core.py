@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -18,9 +19,15 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Protocol
 from urllib import request, error
+
+
+OCR_TEXT_ERROR_RATIO = .15
+OCR_SIGNIFICANT_TEXT = re.compile(r"\d+|[零〇一二两三四五六七八九十百千万亿]+|[不未无非没否]")
 
 
 class QuizError(RuntimeError):
@@ -30,6 +37,20 @@ class QuizError(RuntimeError):
 def normalize(text: str) -> str:
     """Normalize width/whitespace only. Preserve numbers, negations, punctuation."""
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+
+
+def similar_text(first: str, second: str) -> bool:
+    first, second = normalize(first), normalize(second)
+    if first == second:
+        return True
+    if min(len(first), len(second)) < 2:
+        return False
+    if OCR_SIGNIFICANT_TEXT.findall(first) != OCR_SIGNIFICANT_TEXT.findall(second):
+        return False
+    edits = sum(max(end_a - start_a, end_b - start_b)
+                for tag, start_a, end_a, start_b, end_b in
+                SequenceMatcher(None, first, second, autojunk=False).get_opcodes() if tag != "equal")
+    return edits <= max(1, int(max(len(first), len(second)) * OCR_TEXT_ERROR_RATIO))
 
 
 def question_body(text: str) -> str:
@@ -61,12 +82,20 @@ class Question:
     instance_id: str
     scope: str = "dhxy-mobile-cn:profile-v1"
     scene: str = "dali_quiz"
+    is_readable: bool = True
+    visual_token: str = ""
+    visual_instance_id: str = ""
+    unreadable_options: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scene != "dali_quiz":
             raise QuizError("Only the approved normal Dali quiz scene is supported.")
-        if not isinstance(self.stem, str) or not question_body(self.stem):
+        if not isinstance(self.stem, str) or (not question_body(self.stem) and self.is_readable):
             raise QuizError("Missing question text.")
+        if self.is_readable and "*" in self.stem:
+            raise QuizError("Masked question text is not reliable enough for normal answering.")
+        if not self.is_readable and not self.visual_token:
+            raise QuizError("Unreadable questions require a calibrated question image.")
         if not self.instance_id or not self.scope:
             raise QuizError("instance_id and scope are required.")
         if not 2 <= len(self.options) <= 4 or tuple(k for k, _ in self.options) != tuple("ABCD"[:len(self.options)]):
@@ -74,6 +103,9 @@ class Question:
         texts = [normalize(v) for _, v in self.options]
         if any(not t for t in texts) or len(set(texts)) != len(self.options):
             raise QuizError("Options must be nonempty and distinguishable; recheck OCR.")
+        if (self.unreadable_options and (self.is_readable or
+                any(k not in dict(self.options) or dict(self.options)[k] != f"*{k}*" for k in self.unreadable_options))):
+            raise QuizError("Unreadable options require masked values and an unreadable question.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Question:
@@ -94,6 +126,9 @@ class Question:
 
     @property
     def key(self) -> str:
+        if not question_body(self.stem).replace("*", "").strip():
+            return digest([self.scope, self.scene, "unreadable", self.visual_token,
+                           [(k, normalize(v)) for k, v in self.options]])
         # Conservative exception: labels/positions can change the meaning of an answer.
         combined = " ".join([question_body(self.stem), *(v for _, v in self.options)])
         positional = bool(re.search(
@@ -106,6 +141,20 @@ class Question:
     def view_token(self) -> str:
         # instance_id must change on entering another question, even if wording repeats.
         return digest([self.key, self.instance_id, [(k, normalize(v)) for k, v in self.options]])
+
+    @property
+    def submission_token(self) -> str:
+        return digest([self.scope, self.visual_instance_id or self.instance_id])
+
+    def matches_content(self, stem: str, options: tuple[tuple[str, str], ...]) -> bool:
+        first, current = normalize(self.stem), normalize(stem)
+        masked_match = any("*" in pattern and any(c.isalnum() for c in pattern.replace("*", ""))
+                           and fnmatchcase(text, pattern.replace("[", "[[]").replace("?", "[?]"))
+                           for pattern, text in ((first, current), (current, first)))
+        return ((similar_text(first, current) or masked_match) and len(self.options) == len(options)
+                and all(first_label == label and similar_text(first_text, text)
+                        and self.label_for(text) in (None, label)
+                        for (first_label, first_text), (label, text) in zip(self.options, options)))
 
     def label_for(self, answer_text: str) -> str | None:
         found = [k for k, v in self.options if normalize(v) == normalize(answer_text)]
@@ -309,8 +358,8 @@ class QuizStore:
             attempt_id = uuid.uuid4().hex
             db.execute("""INSERT INTO attempts(id,qkey,answer_text,label,view_token,eligible,origin,created_at,instance_token,scope,stem,options_json)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now(), digest([q.scope, q.instance_id]),
-                        q.scope, question_body(q.stem), json.dumps(dict(q.options), ensure_ascii=False)))
+                       (attempt_id, q.key, answer, label, q.view_token, int(eligible), origin, utc_now(), q.submission_token,
+                        q.scope, question_body(q.stem) if q.is_readable else "", json.dumps(dict(q.options), ensure_ascii=False)))
         return Decision(q.key, q.view_token, answer, label, row["status"], origin,
                         row["reason"], attempt_id, eligible)
 
@@ -323,6 +372,39 @@ class QuizStore:
         return self._decision(db, q, {"answer_text": answer, "status": "candidate",
                                      "reason": "随机选择；未判断答案是否正确。"}, "random", True)
 
+    def _partial_verified(self, db, q: Question):
+        if not q.unreadable_options or "*" in q.stem or not question_body(q.stem):
+            return None
+        matches = []
+        known = {label: text for label, text in q.options if label not in q.unreadable_options}
+        for row in db.execute("SELECT * FROM answers WHERE scope=? AND status IN ('verified','needs_review','invalid')", (q.scope,)):
+            if normalize(row["stem"]) != normalize(question_body(q.stem)):
+                continue
+            try:
+                saved = json.loads(row["options_json"])
+                if not isinstance(saved, dict) or len(saved) != len(q.options) or any(not isinstance(v, str) for v in saved.values()):
+                    continue
+                values = list(saved.values())
+                for value in known.values():
+                    index = next(i for i, v in enumerate(values) if normalize(v) == normalize(value))
+                    values.pop(index)
+                possible = False
+                for missing in itertools.permutations(values):
+                    completed = {**known, **dict(zip(q.unreadable_options, missing))}
+                    candidate = Question(q.stem, tuple((k, completed[k]) for k, _ in q.options),
+                                         "partial-check", scope=q.scope, scene=q.scene)
+                    if candidate.key == row["qkey"]:
+                        possible = True
+                        break
+            except (ValueError, TypeError, StopIteration, QuizError):
+                continue
+            if possible:
+                matches.append(row)
+        if len(matches) != 1 or matches[0]["status"] != "verified":
+            return None
+        answer = matches[0]["answer_text"]
+        return matches[0] if answer and q.label_for(answer) not in (None, *q.unreadable_options) else None
+
     def resolve(self, q: Question, provider: AnswerProvider | None = None, *,
                 image: Path | None = None, allow_trial: bool = False,
                 refresh: bool = False, max_daily_calls: int = 30,
@@ -332,17 +414,38 @@ class QuizStore:
             raise QuizError("random_percentage must be an integer from 0 to 100.")
         request_id = uuid.uuid4().hex
         with self.transaction() as db:
+            if not q.is_readable:
+                previous = db.execute("SELECT * FROM attempts WHERE view_token=? ORDER BY rowid DESC LIMIT 1",
+                                      (q.view_token,)).fetchone()
+                if previous and previous["origin"] in {"random_unreadable", "bank_unreadable"}:
+                    bank = self._partial_verified(db, q) if previous["origin"] == "bank_unreadable" else None
+                    eligible = bool(previous["eligible"] and (previous["origin"] == "random_unreadable" or
+                                    (bank and bank["answer_text"] == previous["answer_text"])))
+                    return Decision(q.key, q.view_token, previous["answer_text"], previous["label"],
+                                    "verified" if bank else "candidate", previous["origin"],
+                                    "题目或选项未读清；不学习答案。", previous["id"], eligible)
+                normal = bool(q.unreadable_options) and not random_answer and random_percentage != 100 and (
+                    random_percentage in (None, 0) or random.randrange(100) >= random_percentage)
+                bank = self._partial_verified(db, q) if normal else None
+                if bank:
+                    return self._decision(db, q, bank, "bank_unreadable", False)
+                answer = previous["answer_text"] if previous else random.choice(q.options)[1]
+                return self._decision(db, q, {"answer_text": answer, "status": "candidate",
+                                             "reason": "题目或选项未读清，随机选择；不学习答案。"},
+                                      "random_unreadable", True)
             if random_percentage is not None:
                 previous = db.execute(
-                    "SELECT * FROM attempts WHERE view_token=? AND origin IN ('random','bank') ORDER BY rowid DESC LIMIT 1",
-                    (q.view_token,),
+                    "SELECT * FROM attempts WHERE view_token=? AND (origin IN ('random','bank') OR (? AND origin IN ('openai','cache'))) ORDER BY rowid DESC LIMIT 1",
+                    (q.view_token, provider is not None),
                 ).fetchone()
                 if previous:
-                    bank = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone() if previous["origin"] == "bank" else None
-                    status = (bank["status"] if bank else "miss") if previous["origin"] == "bank" else "candidate"
+                    bank = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone() if previous["origin"] != "random" else None
+                    status = (bank["status"] if bank else "miss") if previous["origin"] != "random" else "candidate"
                     eligible = bool(previous["eligible"] and q.label_for(previous["answer_text"]) == previous["label"]
                                     and (previous["origin"] == "random" or
-                                         (bank and bank["status"] == "verified" and bank["answer_text"] == previous["answer_text"])))
+                                         (bank and bank["answer_text"] == previous["answer_text"] and
+                                          (bank["status"] == "verified" or
+                                           (previous["origin"] in {"openai", "cache"} and bank["status"] == "candidate" and allow_trial)))))
                     return Decision(q.key, q.view_token, previous["answer_text"], previous["label"], status,
                                     previous["origin"], bank["reason"] if bank else "随机选择；未判断答案是否正确。",
                                     previous["id"], eligible)
@@ -351,7 +454,8 @@ class QuizStore:
                 row = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone()
                 if row and row["status"] == "verified" and row["answer_text"] and q.label_for(row["answer_text"]):
                     return self._decision(db, q, row, "bank", False)
-                return self._random_decision(db, q)
+                if provider is None:
+                    return self._random_decision(db, q)
             if random_answer:
                 return self._random_decision(db, q)
             row = db.execute("SELECT * FROM answers WHERE qkey=?", (q.key,)).fetchone()
@@ -369,7 +473,7 @@ class QuizStore:
                 answer_text=NULL,status='asking',reason='',updated_at=excluded.updated_at""",
                        (q.key, q.scope, question_body(q.stem), json.dumps(dict(q.options), ensure_ascii=False), utc_now()))
             db.execute("INSERT INTO requests(id,qkey,game_day,state) VALUES(?,?,?,'started')", (request_id, q.key, game_day()))
-            rejected = [r[0] for r in db.execute("SELECT DISTINCT answer_text FROM attempts WHERE qkey=? AND outcome='wrong' AND origin!='random'", (q.key,))]
+            rejected = [r[0] for r in db.execute("SELECT DISTINCT answer_text FROM attempts WHERE qkey=? AND outcome='wrong' AND origin NOT IN ('random','random_unreadable','bank_unreadable')", (q.key,))]
         try:
             answer = provider.answer(q, rejected, image)
             if answer.decision not in {"answer", "abstain"}:
@@ -419,10 +523,11 @@ class QuizStore:
             if age < 0 or age > max_age_seconds or current.label_for(row["answer_text"]) != row["label"]:
                 return False
             if db.execute("SELECT 1 FROM attempts WHERE instance_token=? AND submitted_at IS NOT NULL LIMIT 1",
-                          (digest([current.scope, current.instance_id]),)).fetchone():
+                          (current.submission_token,)).fetchone():
                 return False
-            bank = db.execute("SELECT status,answer_text FROM answers WHERE qkey=?", (current.key,)).fetchone()
-            if row["origin"] != "random" and (not bank or bank["answer_text"] != row["answer_text"]
+            bank = (self._partial_verified(db, current) if row["origin"] == "bank_unreadable" else
+                    db.execute("SELECT status,answer_text FROM answers WHERE qkey=?", (current.key,)).fetchone())
+            if row["origin"] not in {"random", "random_unreadable"} and (not bank or bank["answer_text"] != row["answer_text"]
                                                or bank["status"] not in {"candidate", "verified"}
                                                or (row["origin"] == "bank" and bank["status"] != "verified")):
                 return False
@@ -455,7 +560,7 @@ class QuizStore:
         if current and current["status"] == "asking":
             return
         conflict = db.execute("""SELECT 1 FROM attempts WHERE qkey=? AND answer_text=?
-            AND outcome='wrong' AND origin!='random'""", (q.key, answer_text)).fetchone()
+            AND outcome='wrong' AND origin NOT IN ('random','random_unreadable','bank_unreadable')""", (q.key, answer_text)).fetchone()
         different = bool(current and current["answer_text"] and normalize(current["answer_text"]) != normalize(answer_text))
         protected = bool(different and current["status"] in {"verified", "needs_review"})
         state = "needs_review" if conflict or protected else "verified"
@@ -476,6 +581,8 @@ class QuizStore:
         """Store an explicit correct-option reveal, never inferred from a wrong/next view."""
         if not isinstance(evidence, str) or not evidence.strip():
             raise QuizError("Describe the actual correct-option reveal.")
+        if not q.is_readable:
+            raise QuizError("Unreadable questions cannot be learned.")
         label = q.label_for(answer_text) if isinstance(answer_text, str) else None
         if label is None:
             raise QuizError("Revealed answer must uniquely match an actual option.")
@@ -504,6 +611,8 @@ class QuizStore:
                 return
             db.execute("UPDATE attempts SET outcome=?,evidence=?,feedback_source=? WHERE id=?",
                        (outcome, evidence, source, attempt_id))
+            if row["origin"] in {"random_unreadable", "bank_unreadable"}:
+                return
             if row["origin"] == "random":
                 if outcome == "correct":
                     self._learn_random(db, row, source)
@@ -516,7 +625,7 @@ class QuizStore:
                 db.execute("UPDATE answers SET status='invalid',reason='Explicit wrong-answer feedback.',updated_at=? WHERE qkey=?", (utc_now(), row["qkey"]))
             elif outcome == "correct":
                 # Conflicting authoritative feedback requires review, not blind overwrite.
-                conflict = db.execute("SELECT 1 FROM attempts WHERE qkey=? AND answer_text=? AND outcome='wrong' AND origin!='random'", (row["qkey"], row["answer_text"])).fetchone()
+                conflict = db.execute("SELECT 1 FROM attempts WHERE qkey=? AND answer_text=? AND outcome='wrong' AND origin NOT IN ('random','random_unreadable','bank_unreadable')", (row["qkey"], row["answer_text"])).fetchone()
                 state = "needs_review" if conflict else "verified"
                 db.execute("UPDATE answers SET status=?,reason=?,updated_at=? WHERE qkey=?",
                            (state, "Conflicting feedback." if conflict else "Confirmed by " + source, utc_now(), row["qkey"]))

@@ -8,7 +8,6 @@ import time
 import numpy as np
 
 from daily_tasks import compact
-from local_vision import scaled_roi
 from quiz_core import QuizError
 from quiz_vision import INPUT_PAUSE_SECONDS
 
@@ -23,6 +22,8 @@ EDGE_BAND = 15
 EDGE_MARGIN = 20
 FADE_MINIMUM = .7
 FADE_MAXIMUM = .3
+FRAME_RED_GREEN_MINIMUM = 10
+FRAME_GREEN_BLUE_MINIMUM = 15
 
 
 def puzzle_visible(view):
@@ -45,12 +46,19 @@ def puzzle_state(view):
 
 
 def puzzle_tiles(view):
-    crops = tuple(view.frame[y:y + h, x:x + w]
-                  for x, y, w, h in (scaled_roi(box, view.width, view.height) for box in TILE_BOXES))
-    ys = (np.arange(159) * crops[0].shape[0] / 159).astype(int)
-    xs = (np.arange(158) * crops[0].shape[1] / 158).astype(int)
-    return tuple(crop[np.minimum(ys, crop.shape[0] - 1)[:, None],
-                      np.minimum(xs, crop.shape[1] - 1)] for crop in crops)
+    tiles = ()
+    for x, y, w, h in TILE_BOXES:
+        # Full-frame pixel centers avoid position-dependent shifts from rounded crop origins.
+        xs = (x + np.arange(w) + .5) * view.width / 834 - .5
+        ys = (y + np.arange(h) + .5) * view.height / 470 - .5
+        left, top = np.floor(xs).astype(int), np.floor(ys).astype(int)
+        wx, wy = (xs - left)[None, :, None], (ys - top)[:, None, None]
+        upper = (view.frame[top[:, None], left] * (1 - wx)
+                 + view.frame[top[:, None], left + 1] * wx)
+        lower = (view.frame[top[:, None] + 1, left] * (1 - wx)
+                 + view.frame[top[:, None] + 1, left + 1] * wx)
+        tiles = (*tiles, np.rint(upper * (1 - wy) + lower * wy).astype(np.uint8))
+    return tiles
 
 
 def corner_order(tiles):
@@ -58,9 +66,10 @@ def corner_order(tiles):
         raise QuizError("拼图尺寸与已校准的2×2布局不符。")
     order = ()
     for tile in tiles:
-        green, red = (tile[:, :, i].astype(int) for i in (1, 2))
-        # shortcut: this artwork has two pale exterior edges per tile; other styles need calibration.
-        fade = (red > 180) & (green > 150) & (tile.max(axis=2).astype(int) - tile.min(axis=2) < 80)
+        blue, green, red = (tile[:, :, i].astype(int) for i in range(3))
+        # shortcut: this skin uses warm cream frames; recalibrate if frame colors change.
+        fade = ((red > 180) & (green > 150) & (tile.max(axis=2).astype(int) - tile.min(axis=2) < 80)
+                & (red - green > FRAME_RED_GREEN_MINIMUM) & (green - blue > FRAME_GREEN_BLUE_MINIMUM))
         m, n = EDGE_MARGIN, EDGE_BAND
         scores = tuple(float(edge.mean()) for edge in
                        (fade[:n, m:-m], fade[m:-m, -n:], fade[-n:, m:-m], fade[m:-m, :n]))
@@ -112,10 +121,16 @@ class PuzzleSolver:
             current = self.runner.read()
             if not puzzle_visible(current):
                 return current
-            fresh_used, _, _ = puzzle_state(current)
-            tiles = puzzle_tiles(current)
-            if fresh_used > used and fresh_used <= used + 2 and same_tiles(expected, tiles):
-                return current
+            try:
+                fresh_used, _, _ = puzzle_state(current)
+            except QuizError:
+                # The success toast can obscure the timer before the puzzle closes itself.
+                if time.monotonic() >= deadline:
+                    raise
+            else:
+                tiles = puzzle_tiles(current)
+                if fresh_used > used and fresh_used <= used + 2 and same_tiles(expected, tiles):
+                    return current
             if time.monotonic() >= deadline:
                 raise QuizError("拼图交换未确认，已暂停，未重复点击或试错。")
             self.runner.sleep(self.runner.options.poll_seconds)
